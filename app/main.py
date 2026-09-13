@@ -1,14 +1,16 @@
 """FastAPI 路由：线路方案与修订的保存、确认、回看（按版参数重算）。"""
 from __future__ import annotations
 
+import json
+
 from fastapi import Depends, FastAPI, HTTPException
 
 from .db import Store
 from .engine import analyze
-from .models import (AnalysisResult, PlanCreate, PlanOut, PlanPayload,
-                     RevisionCreate, RevisionMeta, RevisionOut)
+from .models import (AnalysisResult, ChangeRecord, PlanCreate, PlanOut,
+                     PlanPayload, RevisionCreate, RevisionMeta, RevisionOut)
 
-app = FastAPI(title="生命线通行核算接口", version="1.0.0")
+app = FastAPI(title="生命线通行核算接口", version="1.1.0")
 
 _store: Store | None = None
 
@@ -27,13 +29,48 @@ def _load_revision(store: Store, plan_id: str, rev_no: int):
     return row
 
 
+def _changes(row) -> list[ChangeRecord]:
+    raw = row["changes"] if "changes" in row.keys() else "[]"
+    if not raw:
+        return []
+    try:
+        return [ChangeRecord.model_validate(x) for x in json.loads(raw)]
+    except (ValueError, TypeError):
+        return []
+
+
 def _revision_out(store: Store, plan_id: str, rev_no: int) -> RevisionOut:
     row = _load_revision(store, plan_id, rev_no)
     payload = PlanPayload.model_validate_json(row["payload"])
     return RevisionOut(
         plan_id=plan_id, rev_no=row["rev_no"], status=row["status"],
         note=row["note"], created_at=row["created_at"],
-        payload=payload, analysis=analyze(payload))
+        payload=payload, changes=_changes(row), analysis=analyze(payload))
+
+
+def _require_change_reason(body: RevisionCreate | PlanCreate,
+                           payload: PlanPayload,
+                           prev_payload: PlanPayload | None = None) -> None:
+    """改跨、换滑梭或采用保守边界，必须在 changes 中给出理由（新修订）。"""
+    kinds = {c.kind for c in body.changes}
+    if payload.conservative_bounds.enabled \
+            and "conservative_bounds" not in kinds:
+        raise HTTPException(
+            422, "采用保守边界必须在 changes 中给出 "
+                 "kind=conservative_bounds 的理由")
+    if prev_payload is not None:
+        prev_r = prev_payload.route
+        if [(s.model_dump()) for s in prev_r.spans] \
+                != [s.model_dump() for s in payload.route.spans] \
+                and "span_change" not in kinds:
+            raise HTTPException(422, "修改柔性跨段（端座/支座/预张力/线密度/"
+                                     "弹性参数/限值/过支座能力/容许人数）"
+                                     "必须在 changes 中给出 kind=span_change 的理由")
+        if [(s.model_dump()) for s in prev_r.shuttles] \
+                != [s.model_dump() for s in payload.route.shuttles] \
+                and "shuttle_change" not in kinds:
+            raise HTTPException(422, "更换/修改滑梭必须在 changes 中给出 "
+                                     "kind=shuttle_change 的理由")
 
 
 # ---------------------------------------------------------------- 方案
@@ -41,8 +78,10 @@ def _revision_out(store: Store, plan_id: str, rev_no: int) -> RevisionOut:
 @app.post("/plans", status_code=201)
 def create_plan(body: PlanCreate, store: Store = Depends(get_store)):
     """创建线路方案，同时保存第 1 版修订（草稿）。"""
+    _require_change_reason(body, body.payload)
     plan_id, rev_no = store.create_plan(
-        body.name, body.note, body.payload.model_dump_json())
+        body.name, body.note, body.payload.model_dump_json(),
+        json.dumps([c.model_dump() for c in body.changes], ensure_ascii=False))
     return _revision_out(store, plan_id, rev_no)
 
 
@@ -75,17 +114,23 @@ def get_plan(plan_id: str, store: Store = Depends(get_store)):
 @app.post("/plans/{plan_id}/revisions", status_code=201)
 def add_revision(plan_id: str, body: RevisionCreate,
                  store: Store = Depends(get_store)):
-    """另存修订：人工调序或换装备后，以新修订保存（不改动既有版本）。"""
+    """另存修订：改跨、换滑梭、换装备或采用保守边界后，以新修订保存
+    （不改动既有版本）；相应改动须在 changes 中说明理由。"""
     if store.get_plan(plan_id) is None:
         raise HTTPException(404, f"方案不存在: {plan_id}")
-    rev_no = store.add_revision(plan_id, body.note,
-                                body.payload.model_dump_json())
+    prev_row = store.get_latest_revision(plan_id)
+    prev_payload = (PlanPayload.model_validate_json(prev_row["payload"])
+                    if prev_row is not None else None)
+    _require_change_reason(body, body.payload, prev_payload)
+    rev_no = store.add_revision(
+        plan_id, body.note, body.payload.model_dump_json(),
+        json.dumps([c.model_dump() for c in body.changes], ensure_ascii=False))
     return _revision_out(store, plan_id, rev_no)
 
 
 @app.get("/plans/{plan_id}/revisions/{rev_no}", response_model=RevisionOut)
 def get_revision(plan_id: str, rev_no: int, store: Store = Depends(get_store)):
-    """回看任一修订：动作序列、失败依据、剖面标注均由该版参数重算。"""
+    """回看任一修订：动作序列、失败依据、剖面标注均由**该版参数重算**。"""
     return _revision_out(store, plan_id, rev_no)
 
 
@@ -104,7 +149,13 @@ def update_revision(plan_id: str, rev_no: int, body: RevisionCreate,
     row = _load_revision(store, plan_id, rev_no)
     if row["status"] == "confirmed":
         raise HTTPException(409, "确认稿不可覆盖，请另存修订")
-    store.update_draft_payload(plan_id, rev_no, body.payload.model_dump_json())
+    prev_payload = PlanPayload.model_validate_json(row["payload"])
+    _require_change_reason(body, body.payload, prev_payload)
+    ok = store.update_draft_payload(
+        plan_id, rev_no, body.payload.model_dump_json(),
+        json.dumps([c.model_dump() for c in body.changes], ensure_ascii=False))
+    if not ok:
+        raise HTTPException(409, "确认稿不可覆盖，请另存修订")
     return _revision_out(store, plan_id, rev_no)
 
 

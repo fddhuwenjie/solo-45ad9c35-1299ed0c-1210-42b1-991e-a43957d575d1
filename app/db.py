@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS revisions (
     status TEXT NOT NULL DEFAULT 'draft',
     note TEXT NOT NULL DEFAULT '',
     payload TEXT NOT NULL,
+    changes TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     PRIMARY KEY (plan_id, rev_no)
 );
@@ -41,14 +42,22 @@ class Store:
     def _init(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            # 既有数据库（旧 schema）补齐变更说明列；确认版仍只读
+            cols = {r["name"] for r in c.execute(
+                "PRAGMA table_info(revisions)").fetchall()}
+            if "changes" not in cols:
+                c.execute("ALTER TABLE revisions ADD COLUMN changes"
+                          " TEXT NOT NULL DEFAULT '[]'")
 
     # ------------------------------------------------------------- 方案
-    def create_plan(self, name: str, note: str, payload_json: str) -> tuple[str, int]:
+    def create_plan(self, name: str, note: str, payload_json: str,
+                    changes_json: str = "[]") -> tuple[str, int]:
         plan_id = uuid.uuid4().hex[:12]
         with self._conn() as c:
             c.execute("INSERT INTO plans(id, name, created_at) VALUES (?,?,?)",
                       (plan_id, name, _now()))
-            self._insert_revision(c, plan_id, 1, note, payload_json)
+            self._insert_revision(c, plan_id, 1, note, payload_json,
+                                  changes_json)
         return plan_id, 1
 
     def get_plan(self, plan_id: str) -> sqlite3.Row | None:
@@ -62,19 +71,23 @@ class Store:
 
     # ------------------------------------------------------------- 修订
     def _insert_revision(self, c: sqlite3.Connection, plan_id: str,
-                         rev_no: int, note: str, payload_json: str) -> None:
+                         rev_no: int, note: str, payload_json: str,
+                         changes_json: str = "[]") -> None:
         c.execute(
             "INSERT INTO revisions(plan_id, rev_no, status, note, payload,"
-            " created_at) VALUES (?,?,?,?,?,?)",
-            (plan_id, rev_no, "draft", note, payload_json, _now()))
+            " changes, created_at) VALUES (?,?,?,?,?,?,?)",
+            (plan_id, rev_no, "draft", note, payload_json,
+             changes_json, _now()))
 
-    def add_revision(self, plan_id: str, note: str, payload_json: str) -> int:
+    def add_revision(self, plan_id: str, note: str, payload_json: str,
+                     changes_json: str = "[]") -> int:
         with self._conn() as c:
             row = c.execute(
                 "SELECT COALESCE(MAX(rev_no), 0) AS m FROM revisions"
                 " WHERE plan_id=?", (plan_id,)).fetchone()
             rev_no = row["m"] + 1
-            self._insert_revision(c, plan_id, rev_no, note, payload_json)
+            self._insert_revision(c, plan_id, rev_no, note, payload_json,
+                                  changes_json)
             return rev_no
 
     def get_revision(self, plan_id: str, rev_no: int) -> sqlite3.Row | None:
@@ -83,6 +96,12 @@ class Store:
                 "SELECT * FROM revisions WHERE plan_id=? AND rev_no=?",
                 (plan_id, rev_no)).fetchone()
 
+    def get_latest_revision(self, plan_id: str) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM revisions WHERE plan_id=?"
+                " ORDER BY rev_no DESC LIMIT 1", (plan_id,)).fetchone()
+
     def list_revisions(self, plan_id: str) -> list[sqlite3.Row]:
         with self._conn() as c:
             return c.execute(
@@ -90,13 +109,20 @@ class Store:
                 " WHERE plan_id=? ORDER BY rev_no", (plan_id,)).fetchall()
 
     def update_draft_payload(self, plan_id: str, rev_no: int,
-                             payload_json: str) -> bool:
+                             payload_json: str,
+                             changes_json: str | None = None) -> bool:
         """仅草稿可改；确认稿返回 False（不可覆盖）。"""
         with self._conn() as c:
-            cur = c.execute(
-                "UPDATE revisions SET payload=? WHERE plan_id=? AND rev_no=?"
-                " AND status='draft'",
-                (payload_json, plan_id, rev_no))
+            if changes_json is None:
+                cur = c.execute(
+                    "UPDATE revisions SET payload=? WHERE plan_id=? AND rev_no=?"
+                    " AND status='draft'",
+                    (payload_json, plan_id, rev_no))
+            else:
+                cur = c.execute(
+                    "UPDATE revisions SET payload=?, changes=?"
+                    " WHERE plan_id=? AND rev_no=? AND status='draft'",
+                    (payload_json, changes_json, plan_id, rev_no))
             return cur.rowcount == 1
 
     def confirm_revision(self, plan_id: str, rev_no: int) -> bool:

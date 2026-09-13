@@ -40,6 +40,12 @@ def free_fall_distance(eq: Equipment, d_z: float, anchor_z: float) -> float:
     return max(0.0, min(2.0 * L, L + (d_z - anchor_z)))
 
 
+def free_fall_with_sag(eq: Equipment, d_z: float, anchor_z_static: float,
+                       sag: float) -> float:
+    """滑梭挂在柔性跨段上：坠落后滑梭随钢索下挠 sag（m），挂点下移。"""
+    return free_fall_distance(eq, d_z, anchor_z_static - max(0.0, sag))
+
+
 def arrest_force_kn(person: Person, eq: Equipment, ffd: float,
                     params: CalcParams) -> float:
     """能量法估算止坠力：W·g·(FFD+缓冲行程)/缓冲行程，封顶于装备最大止坠力。"""
