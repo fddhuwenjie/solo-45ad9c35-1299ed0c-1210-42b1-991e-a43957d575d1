@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 
 from ..models import (AnalysisResult, CableResult, CheckFailure, OpenItem,
                       Person, PlanPayload, ProfilePoint, Vec3)
@@ -32,7 +33,25 @@ _CHECK_PRIORITY = {
 }
 
 
+@dataclass
+class AnalysisContext:
+    """一次通行核算的完整上下文：结果之外保留站点、序列状态与悬索解，
+    供坠落后救援推演复用（冻结修订的动作序列、坠距与支座反力）。"""
+    payload: PlanPayload
+    stations: list[tuple[float, float, float]]
+    span_paths: dict[str, SpanPath]
+    missing_by_span: dict[str, list[str]]
+    seq_by_person: dict[str, object]
+    cable_results: list[CableResult]
+    point_falls: dict
+    result: AnalysisResult
+
+
 def analyze(payload: PlanPayload) -> AnalysisResult:
+    return build_context(payload).result
+
+
+def build_context(payload: PlanPayload) -> AnalysisContext:
     route = payload.route
     params = payload.params
     anchors = {a.id: a for a in route.anchors}
@@ -54,6 +73,8 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
 
     failures: list[CheckFailure] = []
     open_items: list[OpenItem] = []
+    # (站, 锚点) -> FallCalc：救援推演复用冻结修订的点锚坠距/止坠力
+    point_falls: dict[tuple[int, str], object] = {}
 
     # ---- 0. 柔性跨段几何与每站滑梭站位 --------------------------------
     span_paths: dict[str, SpanPath] = {}
@@ -234,6 +255,7 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
                 anchor = anchors[aid]
                 fc = calc.fall_calc(stations[i], person, eq, anchor,
                                     route, params)
+                point_falls[(i, aid)] = fc
                 comp = {
                     "anchor": aid,
                     "free_fall_m": fc.free_fall_m,
@@ -503,7 +525,7 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
                                    o.code,
                                    person_idx.get(o.person_id or "", 999)))
     conclusive = not open_items
-    return AnalysisResult(
+    result = AnalysisResult(
         conclusive=conclusive,
         passable=conclusive and not failures,
         first_failure=failures[0] if failures else None,
@@ -516,6 +538,10 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
         conservative_used=sorted(conservative_spans),
         station_count=n,
     )
+    return AnalysisContext(
+        payload=payload, stations=stations, span_paths=span_paths,
+        missing_by_span=missing_by_span, seq_by_person=seq_by_person,
+        cable_results=cable_results, point_falls=point_falls, result=result)
 
 
 # ---------------------------------------------------------------- 悬索组合求解

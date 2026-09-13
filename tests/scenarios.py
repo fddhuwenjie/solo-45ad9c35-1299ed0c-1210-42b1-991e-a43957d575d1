@@ -311,3 +311,55 @@ def mixed_anchor_span_payload():
     # 人员装备取两套可达包络的较大者（2.0 m），滑梭同样可挂
     p["persons"][0]["equipment_id"] = "eqa"
     return p
+
+
+# ---------------------------------------------------------------- 救援推演
+
+def rescue_payload(*, entry=None, anchors=None, rope_main_len=60.0,
+                   rope_sec_len=20.0, ratio=5, eff=0.8,
+                   desc_limit=2.5, rated=22.0, max_time=30.0,
+                   rescuers=2, stretcher_kg=5.0, landing=None,
+                   primary=None, backup=None, rope_team=None,
+                   manual_reason="", anchor_zs=None, params=None):
+    """救援方案载荷：头顶 z=3.4 的两个救援锚点（x=0 与 x=10），
+    5:1 主绳组 + 1:1 二次保护绳组。"""
+    if anchor_zs is None:
+        anchor_zs = [3.4, 3.4]
+    if anchors is None:
+        # 沿路成对密布主锚（y=0）/ 备份锚（y=0.3），任意站 3.5 m
+        # 挂接距离内均有两个不同锚点（竖直 3.4 m + 水平 ≤0.9 m）
+        anchors = []
+        for k, x in enumerate([0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.0]):
+            anchors.append({"id": f"R{k}a", "position": v(x, 0.0, anchor_zs[0]),
+                            "rated_load_kn": rated})
+            anchors.append({"id": f"R{k}b", "position": v(x, 0.3, anchor_zs[1]),
+                            "rated_load_kn": rated})
+    body = {
+        "entry": entry or {"id": "E1", "position": v(0, 0, 0)},
+        "rescue_anchors": anchors,
+        "rescuers": [{"id": f"rr{k + 1}", "weight_kg": 80.0}
+                     for k in range(rescuers)],
+        "rope_teams": [
+            {"id": "RT1", "rope_length_m": rope_main_len,
+             "pulley_ratio": ratio, "pulley_efficiency": eff,
+             "descender_limit_kn": desc_limit},
+            {"id": "RT2", "rope_length_m": rope_sec_len,
+             "pulley_ratio": 1, "pulley_efficiency": 1.0,
+             "descender_limit_kn": desc_limit},
+        ],
+        "secondary_rope_team_id": "RT2",
+        "stretcher": {"id": "ST1", "length_m": 2.0, "width_m": 0.6,
+                      "height_m": 0.4, "weight_kg": stretcher_kg},
+        "max_suspension_minutes": max_time,
+        "landing_point": landing,
+        "manual_reason": manual_reason,
+    }
+    if primary is not None:
+        body["primary_anchor_id"] = primary
+    if backup is not None:
+        body["backup_anchor_id"] = backup
+    if rope_team is not None:
+        body["rope_team_id"] = rope_team
+    if params is not None:
+        body["params"] = params
+    return body

@@ -46,6 +46,33 @@ def free_fall_with_sag(eq: Equipment, d_z: float, anchor_z_static: float,
     return free_fall_distance(eq, d_z, anchor_z_static - max(0.0, sag))
 
 
+def shuttle_fall_components(station: Vec, person: Person, eq: Equipment,
+                            anchor_z_static: float, sag: float,
+                            route, params: CalcParams) -> dict:
+    """滑梭单站单人坠落分量（锚点标高已知，含动态下挠）：FFD、总坠距、
+    所需净空、可用净空与余量。供通行核算与救援推演共用。"""
+    dz = station[2] + person.d_ring_height_m
+    ffd = free_fall_with_sag(eq, dz, anchor_z_static, sag)
+    total = ffd + eq.elongation_m + eq.buffer_travel_m \
+        + params.harness_stretch_m
+    required = total + params.safety_margin_m
+    surfaces = []
+    top = obstacle_top_below(station, person.body_radius_m, route.obstacles)
+    if top is not None:
+        surfaces.append(top)
+    low = lower_level_below(station, eq.lanyard_length_m, route.drop_edges)
+    if low is not None:
+        surfaces.append(low)
+    if surfaces:
+        avail = station[2] - max(surfaces)
+        margin = avail - required
+    else:
+        avail = margin = None
+    return {"anchor_z": anchor_z_static, "ffd": ffd, "total": total,
+            "required": required, "avail": avail, "margin": margin,
+            "arrest_force_kn": arrest_force_kn(person, eq, ffd, params)}
+
+
 def arrest_force_kn(person: Person, eq: Equipment, ffd: float,
                     params: CalcParams) -> float:
     """能量法估算止坠力：W·g·(FFD+缓冲行程)/缓冲行程，封顶于装备最大止坠力。"""

@@ -437,3 +437,246 @@ class PlanOut(BaseModel):
     name: str
     created_at: str
     revisions: list[RevisionMeta]
+
+
+# ---------------------------------------------------------------- 坠落后救援推演
+
+class RescueEntry(BaseModel):
+    """救援入口：救援人员由该位置进入路线接近伤员。"""
+    id: str
+    position: Vec3
+
+
+class RescueAnchor(BaseModel):
+    """可用救援锚点：位置、额定载荷（合力，kN）。"""
+    id: str
+    position: Vec3
+    rated_load_kn: float = Field(gt=0)
+
+
+class Rescuer(BaseModel):
+    """救援人员：重量与持续牵引力由推演参数统一取值。"""
+    id: str
+    weight_kg: float = Field(gt=0)
+
+
+class RopeTeam(BaseModel):
+    """绳组：绳长、滑轮倍率 n（n:1）、滑轮效率、下降器限载（kN）。"""
+    id: str
+    rope_length_m: float = Field(gt=0)
+    pulley_ratio: int = Field(default=3, ge=1, description="滑轮倍率 n（n:1）")
+    pulley_efficiency: float = Field(default=0.8, gt=0, le=1)
+    descender_limit_kn: float = Field(gt=0, description="下降器容许工作载荷")
+
+
+class Stretcher(BaseModel):
+    """担架包络：长×宽×高（m）与自重（kg）。"""
+    id: str
+    length_m: float = Field(gt=0)
+    width_m: float = Field(gt=0)
+    height_m: float = Field(gt=0)
+    weight_kg: float = Field(default=0.0, ge=0)
+
+    def bounding_radius_m(self) -> float:
+        """保守外接球半径（半对角线）：轨迹净空按球体扫掠。"""
+        return 0.5 * (self.length_m ** 2 + self.width_m ** 2
+                      + self.height_m ** 2) ** 0.5
+
+
+class RescueParams(BaseModel):
+    """救援推演的作业参数（均给出工程缺省值，结果中逐步列明）。"""
+    approach_speed_m_min: float = Field(default=25.0, gt=0)
+    rig_secondary_min: float = Field(default=3.0, ge=0)
+    rig_haul_min: float = Field(default=4.0, ge=0)
+    detach_min_per_connection: float = Field(default=2.0, ge=0)
+    rig_transfer_min: float = Field(default=3.0, ge=0)
+    haul_rate_m_min: float = Field(default=6.0, gt=0,
+                                   description="每分钟可拉过的绳程")
+    lower_rate_m_min: float = Field(default=12.0, gt=0)
+    anchor_rig_reach_m: float = Field(
+        default=3.5, gt=0,
+        description="救援人员立于站点时可挂接救援锚点的最大三维距离")
+    entry_max_offset_m: float = Field(
+        default=2.0, gt=0, description="救援入口偏离行走折线的容许距离")
+    rope_tail_m: float = Field(default=2.0, ge=0, description="绳组操作尾绳余量")
+    secondary_pretension_kn: float = Field(
+        default=0.5, ge=0, description="二次保护绳张紧力")
+    rescuer_pull_kn: float = Field(
+        default=0.5, gt=0, description="单人可持续牵引力（kN）")
+    descender_hold_kn: float = Field(
+        default=0.3, ge=0, description="下降器操作尾绳持力（kN）")
+
+
+class RescuePayload(BaseModel):
+    """一版救援方案：入口、救援锚点、救援人员、绳组、担架与悬吊时限。"""
+    entry: RescueEntry
+    rescue_anchors: list[RescueAnchor] = Field(min_length=1)
+    rescuers: list[Rescuer] = Field(min_length=1)
+    rope_teams: list[RopeTeam] = Field(min_length=2,
+                                       description="主绳组与二次保护绳组至少各一")
+    secondary_rope_team_id: str = Field(description="二次保护专用绳组 id")
+    stretcher: Stretcher
+    max_suspension_minutes: float = Field(gt=0)
+    landing_point: Optional[Vec3] = Field(
+        default=None,
+        description="转运目的地；缺省取救援入口位置（升降转运终点）")
+    # 人工指定（缺省由推演按最近可达/最短够用自动选择），给出即须写理由
+    primary_anchor_id: Optional[str] = None
+    backup_anchor_id: Optional[str] = None
+    rope_team_id: Optional[str] = None
+    manual_reason: str = Field(
+        default="", description="人工指定锚点/绳组的理由（人工决定，随作业包保留）")
+    params: RescueParams = Field(default_factory=RescueParams)
+
+    @model_validator(mode="after")
+    def _check_refs(self) -> "RescuePayload":
+        anchor_ids = [a.id for a in self.rescue_anchors]
+        if len(anchor_ids) != len(set(anchor_ids)):
+            raise ValueError("救援锚点 id 重复")
+        rope_ids = [r.id for r in self.rope_teams]
+        if len(rope_ids) != len(set(rope_ids)):
+            raise ValueError("绳组 id 重复")
+        rescuer_ids = [r.id for r in self.rescuers]
+        if len(rescuer_ids) != len(set(rescuer_ids)):
+            raise ValueError("救援人员 id 重复")
+        amap = {a.id for a in self.rescue_anchors}
+        rmap = set(rope_ids)
+        if self.secondary_rope_team_id not in rmap:
+            raise ValueError(
+                f"二次保护绳组 {self.secondary_rope_team_id} 不存在")
+        for fid in (self.primary_anchor_id, self.backup_anchor_id):
+            if fid is not None and fid not in amap:
+                raise ValueError(f"人工指定的救援锚点 {fid} 不存在")
+        if self.rope_team_id is not None:
+            if self.rope_team_id not in rmap:
+                raise ValueError(f"人工指定的绳组 {self.rope_team_id} 不存在")
+            if self.rope_team_id == self.secondary_rope_team_id:
+                raise ValueError("主绳组与二次保护绳组不得为同一绳组（器材重复占用）")
+        if self.primary_anchor_id is not None \
+                and self.primary_anchor_id == self.backup_anchor_id:
+            raise ValueError("主锚点与二次保护锚点不得为同一锚点（器材重复占用）")
+        if (self.primary_anchor_id or self.backup_anchor_id or self.rope_team_id) \
+                and not self.manual_reason.strip():
+            raise ValueError("人工指定锚点或绳组必须在 manual_reason 中写明理由")
+        return self
+
+
+# ---------------------------------------------------------------- 救援推演结果
+
+RescueStepCode = Literal["approach", "secondary_protection", "haul_unload",
+                        "detach_original", "transfer"]
+
+
+class RescueBlock(BaseModel):
+    """最早受阻步骤：步骤、受阻代码、说明与全部计算分量。"""
+    station_index: int
+    person_id: Optional[str] = None
+    step_no: int
+    step_code: RescueStepCode
+    code: str
+    message: str
+    components: dict[str, float | int | str | None] = {}
+
+
+class RescueStep(BaseModel):
+    """一个救援步骤的逐步计算分量。"""
+    step_no: int
+    code: RescueStepCode
+    name: str
+    rope_travel_m: float = 0.0
+    rope_required_m: float = 0.0
+    pull_force_kn: Optional[float] = None
+    anchor_id: Optional[str] = None
+    anchor_resultant_kn: Optional[float] = None
+    descender_load_kn: Optional[float] = None
+    path_clearance_ok: bool = True
+    elapsed_minutes: float = 0.0
+    cumulative_minutes: float = 0.0
+    components: dict[str, float | int | str | None] = {}
+
+
+class StationRescue(BaseModel):
+    """单个悬吊站点（单名伤员）的救援推演。"""
+    station_index: int
+    position: Vec3
+    person_id: str
+    hang_position: Vec3
+    feet_z: float
+    original_connections: list[str] = []
+    primary_anchor_id: Optional[str] = None
+    backup_anchor_id: Optional[str] = None
+    rope_team_id: Optional[str] = None
+    secondary_rope_team_id: Optional[str] = None
+    executable: bool
+    block: Optional[RescueBlock] = None
+    steps: list[RescueStep] = []
+    total_elapsed_minutes: float = 0.0
+
+
+class ManualDecision(BaseModel):
+    field: str
+    value: str
+    reason: str
+
+
+class RescueResult(BaseModel):
+    """整条路线（全部悬吊站点）的救援推演结论。"""
+    source_conclusive: bool
+    source_passable: bool
+    executable: bool = Field(description="任一悬吊站点受阻即为 False")
+    earliest_block: Optional[RescueBlock] = None
+    simulations: list[StationRescue] = []
+    suspension_station_count: int = 0
+    impact_stations: list[dict[str, float | int | str]] = []
+    manual_decisions: list[ManualDecision] = []
+    used_source_anchors: list[str] = []
+    used_source_shuttles: list[str] = []
+    used_persons: list[str] = []
+
+
+# ---------------------------------------------------------------- 救援方案与修订
+
+class RescueChangeRecord(BaseModel):
+    """救援修订变更说明：改入口或换器材必须给出理由。"""
+    kind: Literal["entry_change", "equipment_change"]
+    reason: str = Field(min_length=1)
+    detail: str = ""
+
+
+class RescueCreate(BaseModel):
+    name: str = Field(min_length=1)
+    note: str = ""
+    payload: RescuePayload
+    changes: list[RescueChangeRecord] = []
+
+
+class RescueRevisionCreate(BaseModel):
+    note: str = ""
+    payload: RescuePayload
+    changes: list[RescueChangeRecord] = []
+
+
+class RescuePlanOut(BaseModel):
+    rescue_id: str
+    plan_id: str
+    name: str
+    created_at: str
+    revisions: list[RevisionMeta] = []
+
+
+class RescueRevisionOut(BaseModel):
+    rescue_id: str
+    plan_id: str
+    rev_no: int
+    status: Literal["draft", "confirmed"]
+    note: str
+    created_at: str
+    source_rev_no: int
+    source_locked: bool = Field(description="确认版已冻结来源修订快照")
+    recheck_required: bool = Field(
+        description="原路线已有更新且影响本方案相关站点/器材，待复核")
+    recheck_reason: str = ""
+    payload: RescuePayload
+    changes: list[RescueChangeRecord] = []
+    source: dict
+    result: RescueResult
