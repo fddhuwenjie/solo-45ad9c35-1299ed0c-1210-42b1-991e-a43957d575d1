@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..models import (Anchor, CheckFailure, Equipment, Person, SequenceEvent,
-                      Vec3)
+from ..models import (Anchor, CheckFailure, Equipment, ManualHookAction,
+                      Person, SequenceEvent, Vec3)
 from . import calc, geometry as g
 
 Vec = tuple[float, float, float]
@@ -147,6 +147,130 @@ def build_sequence(person: Person, eq: Equipment, anchors: dict[str, Anchor],
                 capacity[i][aid] = capacity[i].get(aid, 0) + 1
 
     # ---- 终点解钩（逐钩进行，每次事件后记录剩余连接） -------------------
+    for h in ("A", "B"):
+        if hooks[h] is not None:
+            old = hooks[h]
+            hooks[h] = None
+            event(n - 1, "detach", h, old, None)
+            refresh_attached()
+    return res
+
+
+def replay_sequence(person: Person, eq: Equipment,
+                    anchors: dict[str, Anchor], stations: list[Vec],
+                    capacity: list[dict[str, int]],
+                    actions: list[ManualHookAction]) -> PersonSequence:
+    """按人工给定次序回放挂接动作并逐站校验。
+
+    校验规则：进站时已挂接的钩至少一个在当前站有效；detach 后另一钩必须
+    仍保持有效连接；attach/switch 的目标锚点必须在连接器触及范围内且不超
+    多人共用限制；每站处理完动作后（末站除外）至少保留一个有效连接。
+    末站仍挂接的钩由引擎补记解钩事件（离开路线）。
+    """
+    n = len(stations)
+    res = PersonSequence(person_id=person.id)
+    reach = _reachable_sets(stations, person, eq, anchors)
+
+    def pos(i: int) -> Vec3:
+        s = stations[i]
+        return Vec3(x=s[0], y=s[1], z=s[2])
+
+    def users_at(i: int, aid: str) -> int:
+        return capacity[i].get(aid, 0)
+
+    def fail(i: int, action: str, msg: str, comp: dict) -> None:
+        res.failures.append(CheckFailure(
+            station_index=i, position=pos(i), person_id=person.id,
+            action=action, check="hook_chain", message=msg, components=comp))
+        res.states.extend([None] * (n - len(res.states)))
+
+    def event(i: int, action: str, hook: str, frm, to) -> None:
+        res.events.append(SequenceEvent(
+            station_index=i, position=pos(i), person_id=person.id,
+            action=action, hook=hook, from_anchor=frm, to_anchor=to,
+            attached_after=[]))
+
+    def refresh_attached() -> None:
+        if res.events:
+            res.events[-1].attached_after = sorted(
+                {x for x in hooks.values() if x})
+
+    # 同站动作保持输入先后次序
+    by_station: dict[int, list[ManualHookAction]] = {}
+    for act in actions:
+        by_station.setdefault(act.station_index, []).append(act)
+
+    hooks: dict[str, str | None] = {"A": None, "B": None}
+
+    def live(i: int) -> list[str]:
+        return [h for h in ("A", "B")
+                if hooks[h] is not None and hooks[h] in reach[i]]
+
+    for i in range(n):
+        # 进站校验：已有挂接时，至少一个在当前站有效
+        if any(hooks.values()) and not live(i):
+            fail(i, "traverse",
+                 "行进至当前站时已无有效连接（换挂链断开）",
+                 {"hook_A": hooks["A"] or "", "hook_B": hooks["B"] or "",
+                  "reachable_anchors": ",".join(sorted(reach[i]))})
+            return res
+
+        for act in by_station.get(i, []):
+            h = act.hook
+            if act.action == "detach":
+                other = "B" if h == "A" else "A"
+                if hooks[other] is None or hooks[other] not in reach[i]:
+                    fail(i, "detach",
+                         f"解钩 {h} 后另一钩无有效连接，不允许松开",
+                         {"failing_hook": h,
+                          "other_hook_anchor": hooks[other] or ""})
+                    return res
+                old = hooks[h]
+                hooks[h] = None
+                event(i, "detach", h, old, None)
+            else:
+                aid = act.anchor
+                if aid not in reach[i]:
+                    fail(i, act.action,
+                         f"目标锚点 {aid} 在当前站超出连接器触及范围",
+                         {"failing_hook": h, "target_anchor": aid or "",
+                          "reachable_anchors": ",".join(sorted(reach[i]))})
+                    return res
+                if users_at(i, aid) + 1 > anchors[aid].max_users:
+                    fail(i, act.action,
+                         f"锚点 {aid} 共用人数已达上限 "
+                         f"{anchors[aid].max_users}",
+                         {"failing_hook": h, "target_anchor": aid,
+                          "max_users": anchors[aid].max_users})
+                    return res
+                old = hooks[h]
+                hooks[h] = aid
+                event(i, act.action, h, old, aid)
+            refresh_attached()
+
+        # 出站校验（末站允许全部解钩离开路线）
+        if i < n - 1 and not live(i):
+            fail(i, "traverse",
+                 "当前站结束后无任何有效连接，"
+                 "继续行进将出现双钩同时解开的瞬间",
+                 {"hook_A": hooks["A"] or "", "hook_B": hooks["B"] or ""})
+            return res
+
+        res.states.append((hooks["A"], hooks["B"]))  # type: ignore[arg-type]
+        for aid in {hooks["A"], hooks["B"]}:
+            if aid:
+                capacity[i][aid] = capacity[i].get(aid, 0) + 1
+
+    # 站点索引越界的人工动作
+    leftover = [a for k, acts in by_station.items() if k >= n for a in acts]
+    if leftover:
+        a0 = leftover[0]
+        fail(n - 1, a0.action,
+             f"人工动作站点 {a0.station_index} 超出路线站点范围（共 {n} 站）",
+             {"station_index": a0.station_index, "station_count": n})
+        return res
+
+    # 终点解钩
     for h in ("A", "B"):
         if hooks[h] is not None:
             old = hooks[h]

@@ -121,3 +121,33 @@ def sharing_limit_payload():
          "rated_load_kn": 12.0, "max_users": 1}]
     p["persons"] = [base_person("p1"), base_person("p2")]
     return p
+
+
+def single_overload_payload(rated=0.1):
+    """单人止坠合力 0.7848 kN 超过锚点额定值。"""
+    p = passable_payload()
+    for a in p["route"]["anchors"]:
+        a["rated_load_kn"] = rated
+    return p
+
+
+def manual_order_payload():
+    """人工挂接次序：站点 0 双钩挂 A0，随后在站点 3k-2 依次换挂 A1..A7。
+
+    自动算法在站点 2 才换钩，人工次序把首次换钩提前到站点 1，可据此区分。
+    """
+    p = passable_payload()
+    acts = [
+        {"person_id": "p1", "hook": "A", "action": "attach",
+         "anchor": "A0", "station_index": 0},
+        {"person_id": "p1", "hook": "B", "action": "attach",
+         "anchor": "A0", "station_index": 0},
+    ]
+    for k in range(1, 8):
+        s = 3 * k - 2
+        acts.append({"person_id": "p1", "hook": "A", "action": "switch",
+                     "anchor": f"A{k}", "station_index": s})
+        acts.append({"person_id": "p1", "hook": "B", "action": "switch",
+                     "anchor": f"A{k}", "station_index": s})
+    p["hook_order"] = acts
+    return p

@@ -4,7 +4,7 @@ from __future__ import annotations
 from ..models import (AnalysisResult, CheckFailure, Person, PlanPayload,
                       ProfilePoint, Vec3)
 from . import calc, geometry as g
-from .sequence import build_sequence
+from .sequence import build_sequence, replay_sequence
 
 # 同站失败排序优先级（数值小者优先，作为“最先失败”）
 _CHECK_PRIORITY = {
@@ -35,11 +35,20 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
     failures: list[CheckFailure] = []
 
     # ---- 1. 挂接/换钩/解钩序列（多人共享锚点容量） ----------------------
+    # 该版给出人工挂接动作次序的人员按次序回放校验，其余人员自动生成
+    manual: dict[str, list] = {}
+    for act in payload.hook_order:
+        manual.setdefault(act.person_id, []).append(act)
+
     capacity: list[dict[str, int]] = [dict() for _ in range(n)]
     sequences = []
     for person in payload.persons:
         eq = equipment[person.equipment_id]
-        seq = build_sequence(person, eq, anchors, stations, capacity)
+        if person.id in manual:
+            seq = replay_sequence(person, eq, anchors, stations, capacity,
+                                  manual[person.id])
+        else:
+            seq = build_sequence(person, eq, anchors, stations, capacity)
         sequences.append(seq)
         failures.extend(seq.failures)
 
@@ -55,7 +64,7 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
         for i, state in enumerate(seq.states):
             if state is None:
                 break
-            for aid in sorted(set(state)):
+            for aid in sorted({a for a in state if a}):
                 anchor = anchors[aid]
                 fc = calc.fall_calc(stations[i], person, eq, anchor,
                                     route, params)
@@ -125,24 +134,29 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
                 if person.id not in anchor_users[i][aid]:
                     anchor_users[i][aid].append(person.id)
 
-    # ---- 3. 共用锚点过载（合力 > 额定载荷） ------------------------------
+    # ---- 3. 锚点过载：每个在用锚点核对合力与额定载荷 --------------------
     for i in range(n):
         for aid, total in anchor_load[i].items():
             users = anchor_users[i][aid]
-            if len(users) > 1 and total > anchors[aid].rated_load_kn:
+            rated = anchors[aid].rated_load_kn
+            if users and total > rated + 1e-9:
+                if len(users) > 1:
+                    msg = (f"共用锚点 {aid} 过载：{len(users)} 人合力 "
+                           f"{round(total, 3)} kN 超过额定载荷 {rated} kN")
+                else:
+                    msg = (f"锚点 {aid} 过载：止坠合力 {round(total, 3)} kN "
+                           f"超过额定载荷 {rated} kN")
                 failures.append(CheckFailure(
                     station_index=i, position=pos(i),
                     person_id=None, action="traverse",
                     check="anchor_overload",
-                    message=(f"共用锚点 {aid} 过载：{len(users)} 人合力 "
-                             f"{round(total, 3)} kN 超过额定载荷 "
-                             f"{anchors[aid].rated_load_kn} kN"),
+                    message=msg,
                     components={
                         "anchor": aid,
                         "user_count": len(users),
                         "users": ",".join(sorted(users)),
                         "combined_force_kn": round(total, 4),
-                        "rated_load_kn": anchors[aid].rated_load_kn,
+                        "rated_load_kn": rated,
                     }))
 
     # ---- 4. 剖面标注（以首名人员的控制性锚点为准） -----------------------
@@ -156,7 +170,7 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
                           walk_z=stations[i][2])
         if state is not None:
             best = None
-            for aid in sorted(set(state)):
+            for aid in sorted({a for a in state if a}):
                 fc = calc.fall_calc(stations[i], person0, eq0, anchors[aid],
                                     route, params)
                 if best is None or fc.required_clearance_m > best[1].required_clearance_m:

@@ -95,12 +95,31 @@ class RouteSpec(BaseModel):
     anchors: list[Anchor] = Field(min_length=1)
 
 
+class ManualHookAction(BaseModel):
+    """人工挂接动作：在指定站点对某钩执行挂接/换钩/解钩。"""
+    person_id: str
+    hook: Literal["A", "B"]
+    action: Literal["attach", "switch", "detach"]
+    anchor: Optional[str] = Field(
+        default=None, description="目标锚点 id（attach/switch 必填，detach 省略）")
+    station_index: int = Field(ge=0, description="动作发生的站点序号")
+
+    @model_validator(mode="after")
+    def _check_anchor(self) -> "ManualHookAction":
+        if self.action in ("attach", "switch") and not self.anchor:
+            raise ValueError("attach/switch 必须给出目标锚点 anchor")
+        return self
+
+
 class PlanPayload(BaseModel):
     """一版修订的全部参数：路线 + 人员 + 装备 + 计算参数。"""
     route: RouteSpec
     persons: list[Person] = Field(min_length=1)
     equipment: list[Equipment] = Field(min_length=1)
     params: CalcParams = Field(default_factory=CalcParams)
+    hook_order: list[ManualHookAction] = Field(
+        default_factory=list,
+        description="人工挂接动作次序；为空则按自动算法生成序列")
 
     @model_validator(mode="after")
     def _check_refs(self) -> "PlanPayload":
@@ -111,6 +130,15 @@ class PlanPayload(BaseModel):
         anchor_ids = [a.id for a in self.route.anchors]
         if len(anchor_ids) != len(set(anchor_ids)):
             raise ValueError("锚点 id 重复")
+        person_ids = {p.id for p in self.persons}
+        anchor_id_set = set(anchor_ids)
+        for act in self.hook_order:
+            if act.person_id not in person_ids:
+                raise ValueError(
+                    f"人工动作引用了不存在的人员 {act.person_id}")
+            if act.anchor is not None and act.anchor not in anchor_id_set:
+                raise ValueError(
+                    f"人工动作引用了不存在的锚点 {act.anchor}")
         return self
 
 

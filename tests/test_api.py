@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 from app.db import Store
 from app.main import app, get_store
 
-from .scenarios import clearance_payload, passable_payload
+from .scenarios import (clearance_payload, manual_order_payload,
+                        passable_payload, single_overload_payload)
 
 
 @pytest.fixture()
@@ -100,3 +101,64 @@ def test_invalid_payload_rejected(client):
     bad["persons"][0]["equipment_id"] = "ghost"
     r = client.post("/plans", json={"name": "x", "note": "", "payload": bad})
     assert r.status_code == 422
+
+    bad2 = passable_payload()
+    bad2["hook_order"] = [
+        {"person_id": "p1", "hook": "A", "action": "attach",
+         "anchor": "ghost", "station_index": 0}]
+    r = client.post("/plans", json={"name": "x", "note": "", "payload": bad2})
+    assert r.status_code == 422
+
+
+def test_single_person_overload_api(client):
+    r = client.post("/plans", json={
+        "name": "o", "note": "", "payload": single_overload_payload()})
+    assert r.status_code == 201
+    a = r.json()["analysis"]
+    assert a["passable"] is False
+    ff = a["first_failure"]
+    assert ff["check"] == "anchor_overload"
+    assert ff["action"] == "traverse"
+    assert ff["components"]["user_count"] == 1
+    assert ff["components"]["combined_force_kn"] > \
+        ff["components"]["rated_load_kn"]
+
+
+def test_manual_order_revisions_recomputed(client):
+    # rev1：无人工次序，自动算法在站点 2 首次换钩
+    r = client.post("/plans", json={
+        "name": "m", "note": "", "payload": passable_payload()})
+    assert r.status_code == 201
+    plan_id = r.json()["plan_id"]
+    auto_sw = next(e for e in r.json()["analysis"]["sequence"]
+                   if e["action"] == "switch")
+    assert auto_sw["station_index"] == 2
+
+    # rev2：人工调序，首次换钩提前到站点 1，另存修订
+    r = client.post(f"/plans/{plan_id}/revisions", json={
+        "note": "人工调序", "payload": manual_order_payload()})
+    assert r.status_code == 201
+    assert r.json()["analysis"]["passable"] is True
+    seq2 = r.json()["analysis"]["sequence"]
+    sw2 = next(e for e in seq2 if e["action"] == "switch")
+    assert sw2["station_index"] == 1 and sw2["to_anchor"] == "A1"
+
+    # 回看 rev1：仍按该版（自动次序）重算
+    r = client.get(f"/plans/{plan_id}/revisions/1")
+    sw1 = next(e for e in r.json()["analysis"]["sequence"]
+               if e["action"] == "switch")
+    assert sw1["station_index"] == 2
+
+    # 确认 rev2 后不可覆盖
+    r = client.post(f"/plans/{plan_id}/revisions/2/confirm")
+    assert r.json()["status"] == "confirmed"
+    r = client.put(f"/plans/{plan_id}/revisions/2",
+                   json={"note": "x", "payload": passable_payload()})
+    assert r.status_code == 409
+
+    # 定稿后回看仍按人工次序重算，剖面标注齐全
+    r = client.get(f"/plans/{plan_id}/revisions/2/analysis")
+    a = r.json()
+    sw = next(e for e in a["sequence"] if e["action"] == "switch")
+    assert sw["station_index"] == 1
+    assert len(a["profile"]) == a["station_count"]
