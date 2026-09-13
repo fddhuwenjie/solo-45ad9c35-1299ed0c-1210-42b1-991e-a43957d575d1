@@ -129,9 +129,9 @@ class Shuttle(BaseModel):
         default=0.3, ge=0, description="连接器超出人员绳端的触及余量")
     max_users: int = Field(default=1, ge=1, description="同一滑梭容许同时挂接人数")
     can_pass: bool = Field(
-        default=True, description="滑梭自身能否通过断开式中间支座"
-
-                                  "（须与跨段 shuttle_pass 同时满足）")
+        default=True,
+        description="滑梭自身能否通过断开式中间支座"
+                    "（须与跨段 shuttle_pass 同时满足）")
 
 
 class ConservativeBounds(BaseModel):
@@ -339,6 +339,9 @@ class CableResult(BaseModel):
     falling_persons: list[str]
     loads_kn: list[float]
     load_fractions: list[float]
+    total_fall_m: list[float] = Field(
+        default_factory=list,
+        description="与 falling_persons 同序的各人总坠距（m，含动态下挠）")
     sag_m: float = Field(description="相对最高支座连线的动态下挠（m）")
     max_sag_m: Optional[float] = Field(
         default=None, description="本跨挠度限值（m），缺失为 None")

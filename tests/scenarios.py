@@ -151,3 +151,163 @@ def manual_order_payload():
                      "anchor": f"A{k}", "station_index": s})
     p["hook_order"] = acts
     return p
+
+
+# ---------------------------------------------------------------- 柔性跨段
+
+def flex_equipment(**kw):
+    """滑梭短绳装备：绳长 1.2 m，连接器余量 0.3 m。"""
+    eq = {
+        "id": "eqf",
+        "lanyard_length_m": 1.2,
+        "elongation_m": 0.2,
+        "buffer_travel_m": 1.0,
+        "sharp_edge_rating": 1,
+        "connector_reach_m": 0.3,
+        "max_arrest_force_kn": 6.0,
+    }
+    eq.update(kw)
+    return eq
+
+
+def flex_span_route(supports=None, span_kw=None, shuttles=None,
+                    shuttle_kw=None, anchors=None, drop_edges=None,
+                    obstacles=None):
+    """0~10 m 直线管廊 + 头顶柔性跨段（默认端座 z=2.6）。
+
+    默认给两条滑梭（双钩各一），跨段容许 2 人。
+    """
+    if supports is None:
+        supports = [
+            {"id": "S0", "position": v(0, 0, 2.6), "rated_load_kn": 50.0},
+            {"id": "S1", "position": v(10, 0, 2.6), "rated_load_kn": 50.0},
+        ]
+    span = {
+        "id": "H1",
+        "supports": [s["id"] for s in supports],
+        "pretension_kn": 5.0,
+        "line_density_kg_m": 0.3,
+        "axial_stiffness_kn": 20000.0,
+        "max_sag_m": 1.5,
+        "shuttle_pass": True,
+        "max_users": 2,
+    }
+    if span_kw:
+        span.update(span_kw)
+    if shuttles is None:
+        kw = {"connector_reach_m": 0.3, "max_users": 2}
+        if shuttle_kw:
+            kw.update(shuttle_kw)
+        shuttles = [
+            {"id": "T1", "span_id": "H1", **kw},
+            {"id": "T2", "span_id": "H1", **kw},
+        ]
+    return {
+        "walk_polyline": [v(0, 0, 0), v(10, 0, 0)],
+        "drop_edges": drop_edges or [],
+        "obstacles": obstacles or [],
+        "anchors": anchors or [],
+        "supports": supports,
+        "spans": [span],
+        "shuttles": shuttles,
+    }
+
+
+def flex_payload(persons=1, **route_kw):
+    return {
+        "route": flex_span_route(**route_kw),
+        "persons": [{"id": f"p{k + 1}", "weight_kg": 80.0,
+                     "equipment_id": "eqf"}
+                    for k in range(persons)],
+        "equipment": [flex_equipment()],
+        "params": {"station_spacing_m": 0.5},
+    }
+
+
+def flex_passable_payload():
+    """双滑梭单作业者，自动序列可通行。"""
+    return flex_payload()
+
+
+def flex_manual_jam_payload():
+    """人工把滑梭挂在跨起点，随后越过不可通过的中间支座（卡支座）。"""
+    p = flex_payload(
+        supports=[
+            {"id": "S0", "position": v(0, 0, 2.6), "rated_load_kn": 50.0},
+            {"id": "SM", "position": v(5, 0, 2.6), "rated_load_kn": 50.0},
+            {"id": "S1", "position": v(10, 0, 2.6), "rated_load_kn": 50.0},
+        ],
+        span_kw={"supports": ["S0", "SM", "S1"], "shuttle_pass": False})
+    p["hook_order"] = [
+        {"person_id": "p1", "hook": "A", "action": "attach",
+         "shuttle": "T1", "station_index": 0},
+        {"person_id": "p1", "hook": "B", "action": "attach",
+         "shuttle": "T2", "station_index": 0},
+    ]
+    return p
+
+
+def flex_duplicate_shuttle_payload():
+    """同一人的 A、B 钩在同站重复挂到同一滑梭 T1（重复占用，不下结论）。"""
+    p = flex_payload(shuttles=[{"id": "T1", "span_id": "H1",
+                                "connector_reach_m": 0.3, "max_users": 2}])
+    p["hook_order"] = [
+        {"person_id": "p1", "hook": "A", "action": "attach",
+         "shuttle": "T1", "station_index": 0},
+        {"person_id": "p1", "hook": "B", "action": "attach",
+         "shuttle": "T1", "station_index": 0},
+    ]
+    return p
+
+
+def flex_missing_params_payload():
+    """缺少预张力：悬索无法求解，不下结论。"""
+    return flex_payload(span_kw={"pretension_kn": None})
+
+
+def flex_weak_support_payload():
+    """端座结构容许反力过低：同跨组合反力越限。"""
+    return flex_payload(
+        supports=[
+            {"id": "S0", "position": v(0, 0, 2.6), "rated_load_kn": 5.0},
+            {"id": "S1", "position": v(10, 0, 2.6), "rated_load_kn": 50.0},
+        ])
+
+
+def flex_two_persons_payload():
+    """两人同跨：四条滑梭（每人双钩各一条，滑梭限 1 人），跨段容许 2 人。
+
+    同站同 bay 时既给出每人单人 CableResult，也给出全员同时坠落组合。
+    """
+    shuttles = [
+        {"id": f"T{k}", "span_id": "H1", "connector_reach_m": 0.3,
+         "max_users": 1}
+        for k in range(1, 5)
+    ]
+    return flex_payload(persons=2, shuttles=shuttles)
+
+
+def flex_clearance_payload():
+    """下层障碍侵入净空：钢索动态下挠占用脚下净空后余量为负。"""
+    return flex_payload(obstacles=[
+        {"kind": "box", "id": "b1",
+         "min": v(0, -1, -2.5), "max": v(10, 1, -2.0)}])
+
+
+def mixed_anchor_span_payload():
+    """点锚 + 柔性跨段混用：x∈[0,6] 点锚（与端座同高 z=2.6，配 2 m 绳装备），
+    x∈[0,10] 柔性跨段，重叠区可点锚↔滑梭换挂，双钩分别用点锚/滑梭。"""
+    anchors = [
+        {"id": f"A{k}", "position": v(x, 0, 2.6),
+         "rated_load_kn": 12.0, "max_users": 1}
+        for k, x in enumerate([0, 1.5, 3.0, 4.5, 6.0])
+    ]
+    p = flex_payload(anchors=anchors)
+    # 两套装备：点锚段用 2 m 绳（余量 0.3），人员只有一名时引用点锚装备
+    p["equipment"].append({
+        "id": "eqa", "lanyard_length_m": 2.0, "elongation_m": 0.2,
+        "buffer_travel_m": 1.0, "sharp_edge_rating": 1,
+        "connector_reach_m": 0.3, "max_arrest_force_kn": 6.0})
+    # 人员装备取两套可达包络的较大者（2.0 m），滑梭同样可挂
+    p["persons"][0]["equipment_id"] = "eqa"
+    return p

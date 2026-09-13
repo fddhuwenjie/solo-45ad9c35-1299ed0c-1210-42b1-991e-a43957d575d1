@@ -74,7 +74,8 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
         reach = eq.lanyard_length_m + shuttles[sid].connector_reach_m
         return g.dist3(d, t.point) <= reach + 1e-9
 
-    # 容量计数：点锚按目标（人去重）；滑梭按挂接人次；跨段人数单独累计
+    # 容量计数：点锚/滑梭按“占用钩数（人去重）”记录，用于他人容量上限；
+    # 同一人 A/B 钩重复挂同一滑梭属 duplicate_occupancy（双钩不独立，不下结论）。
     anchor_count: list[dict[str, set[str]]] = [dict() for _ in range(n)]
     shuttle_count: list[dict[str, set[str]]] = [dict() for _ in range(n)]
     span_users: list[dict[str, set[str]]] = [dict() for _ in range(n)]
@@ -104,19 +105,43 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
                 last_cache[t] = arr
             return last_cache[t][i]
 
-        def capacity_ok(i: int, t: Target) -> bool:
+        def attach_block(i: int, t: Target, other: Target | None):
+            """返回 None 表示可挂；否则 (code, components)。
+
+            点锚：他人占用达上限 → capacity_full（旧语义失效）。
+            滑梭：本人另一钩已挂同一滑梭 → duplicate_occupancy；
+            滑梭或跨段的他人占用达上限 → duplicate_occupancy（不下结论）。
+            """
             kind, tid = t
             if kind == "anchor":
-                used = len(anchor_count[i].get(tid, set()))
-                return used + 1 <= anchors[tid].max_users
-            used = len(shuttle_count[i].get(tid, set()))
-            if used + 1 > shuttles[tid].max_users:
-                return False
-            sp = shuttles[tid].span_id
-            su = len(span_users[i].get(sp, set()))
-            return su + 1 <= spans[sp].max_users
+                others = anchor_count[i].get(tid, set()) - {person.id}
+                if len(others) >= anchors[tid].max_users:
+                    return "capacity_full", {
+                        "target_anchor": tid,
+                        "max_users": anchors[tid].max_users,
+                        "occupants": ",".join(sorted(others))}
+                return None
+            sh = shuttles[tid]
+            spid = sh.span_id
+            if other == t:
+                return "duplicate_occupancy", {
+                    "target_shuttle": tid, "span": spid,
+                    "reason": "same_person_other_hook"}
+            oth_s = shuttle_count[i].get(tid, set()) - {person.id}
+            if len(oth_s) >= sh.max_users:
+                return "duplicate_occupancy", {
+                    "target_shuttle": tid, "span": spid,
+                    "max_users": sh.max_users,
+                    "occupants": ",".join(sorted(oth_s))}
+            oth_span = span_users[i].get(spid, set()) - {person.id}
+            if len(oth_span) >= spans[spid].max_users:
+                return "duplicate_occupancy", {
+                    "target_shuttle": tid, "span": spid,
+                    "span_max_users": spans[spid].max_users,
+                    "occupants": ",".join(sorted(oth_span))}
+            return None
 
-        def occupy(i: int, t: Target) -> None:
+        def occupy(i: int, t: Target, hook: str) -> None:
             kind, tid = t
             if kind == "anchor":
                 anchor_count[i].setdefault(tid, set()).add(person.id)
@@ -143,7 +168,7 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
 
         return ReachProvider(
             n=n, stations=stations, reachable=reachable,
-            last_reach=last_reach, capacity_ok=capacity_ok, occupy=occupy,
+            last_reach=last_reach, attach_block=attach_block, occupy=occupy,
             targets=targets, pos_fn=pos, target_pos=target_pos,
             anchor_max_users=lambda aid: anchors[aid].max_users,
             shuttle_span=lambda sid: shuttles[sid].span_id,
@@ -347,30 +372,38 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
                 if len(members) > 1:
                     combos.append(members)
                 full_idx = len(combos) - 1
-                worst = None
                 full_result = None
+                solo_results: dict[str, tuple] = {}
                 for ci, combo in enumerate(combos):
                     sol, force_map = solve_combo(i, spid, bay_index, combo)
                     if sol is None:
                         continue
                     if sol.conservative:
                         conservative_spans.add(spid)
-                    if worst is None or sol.sag_m > worst[0].sag_m:
-                        worst = (sol, combo, force_map)
-                    if ci == full_idx:
+                    if len(combo) > 1:
                         full_result = (sol, combo, force_map)
+                    else:
+                        solo_results[combo[0][0]] = (sol, combo, force_map)
                     _evaluate_combo_failures(
                         i, spid, bay_index, combo, sol, force_map, person_map,
                         equipment, route, params, stations, pos,
                         shuttle_fall_components, span_paths, shuttles,
                         spans, supports, failures,
                         structural=(ci == full_idx))
-                chosen = full_result or worst
-                if chosen is not None:
-                    sol, combo, force_map = chosen
+                # 结果记录：多人 bay 记全员组合（结构包络）+ 每人单人组合；
+                # 单人 bay 仅记一条单人结果
+                if full_result is None:
+                    record = [solo_results[pid]
+                              for pid, _sid in members if pid in solo_results]
+                else:
+                    record = [full_result] + [
+                        solo_results[pid]
+                        for pid, _sid in members if pid in solo_results]
+                for sol, combo, force_map in record:
                     _append_cable_result(
                         cable_results, i, spid, bay_index, combo, sol,
-                        force_map, spans, supports, span_paths, grav)
+                        force_map, spans, supports, span_paths, grav,
+                        person_map, equipment, params, stations)
 
     # ---- 6. 点锚合力过载 ----------------------------------------------
     for i in range(n):
@@ -397,9 +430,15 @@ def analyze(payload: PlanPayload) -> AnalysisResult:
     profile: list[ProfilePoint] = []
     p0 = payload.persons[0]
     eq0 = equipment[p0.equipment_id]
-    # 站 i -> 该站首人滑梭的已求最差悬索分量（从 cable_results 取）
-    cable_by_station_span: dict[tuple[int, str], CableResult] = {
-        (cr.station_index, cr.span_id): cr for cr in cable_results}
+    # 站 i -> 该站首人滑梭的已求悬索分量：优先取其单人结果（个人净空），
+    # 无单人结果时退回结构包络组合。
+    cable_by_station_span: dict[tuple[int, str], CableResult] = {}
+    for cr in cable_results:
+        key = (cr.station_index, cr.span_id)
+        if key not in cable_by_station_span:
+            cable_by_station_span[key] = cr
+        if cr.falling_persons == [p0.id]:
+            cable_by_station_span[key] = cr
     for i in range(n):
         pp = ProfilePoint(station_index=i, position=pos(i),
                           walk_z=stations[i][2])
@@ -687,15 +726,29 @@ def _evaluate_combo_failures(i, span_id, bay_index, combo, sol, force_map,
 
 
 def _append_cable_result(cable_results, i, span_id, bay_index, combo, sol,
-                         force_map, spans, supports, span_paths, gravity):
+                         force_map, spans, supports, span_paths, gravity,
+                         person_map, equipment, params, stations):
     reactions = _support_reactions(sol, span_id, spans, span_paths, gravity,
                                    loaded_bay=bay_index)
+    path = span_paths[span_id]
+    t = path.table[i]
+    total_falls = []
+    for k, (pid, _sid) in enumerate(combo):
+        person = person_map[pid]
+        eq = equipment[person.equipment_id]
+        ffd = calc.free_fall_with_sag(
+            eq, stations[i][2] + person.d_ring_height_m,
+            t.point[2], sol.load_sags_m[k])
+        total_falls.append(round(
+            ffd + eq.elongation_m + eq.buffer_travel_m
+            + params.harness_stretch_m, 4))
     c = sol.chord_rise / max(sol.horiz_span, 1e-9)
     cable_results.append(CableResult(
         span_id=span_id, station_index=i, bay_index=bay_index,
         falling_persons=[pid for pid, _ in combo],
         loads_kn=[round(force_map[pid], 4) for pid, _ in combo],
         load_fractions=[round(f, 4) for f in sol.load_fractions],
+        total_fall_m=total_falls,
         sag_m=round(sol.sag_m, 4),
         max_sag_m=spans[span_id].max_sag_m,
         horizontal_tension_kn=round(sol.h_kn, 4),

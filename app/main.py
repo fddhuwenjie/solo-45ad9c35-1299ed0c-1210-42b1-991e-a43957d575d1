@@ -48,6 +48,21 @@ def _revision_out(store: Store, plan_id: str, rev_no: int) -> RevisionOut:
         payload=payload, changes=_changes(row), analysis=analyze(payload))
 
 
+def _structural_route_signature(p: PlanPayload):
+    """跨段 / 滑梭的结构性参数（不含说明性字段）；变化即重大修改。"""
+    return (
+        [(s.id, s.supports, s.pretension_kn, s.line_density_kg_m,
+          s.axial_stiffness_kn, s.cross_section_m2, s.elastic_modulus_kn_m2,
+          s.max_sag_m, s.shuttle_pass, s.max_users)
+         for s in p.route.spans],
+        [(s.id, s.span_id, s.connector_reach_m, s.can_pass, s.max_users)
+         for s in p.route.shuttles],
+        [(s.id, s.position.model_dump(), s.rated_load_kn,
+          s.allowed_axis.model_dump() if s.allowed_axis else None,
+          s.allowed_half_angle_deg) for s in p.route.supports],
+    )
+
+
 def _require_change_reason(body: RevisionCreate | PlanCreate,
                            payload: PlanPayload,
                            prev_payload: PlanPayload | None = None) -> None:
@@ -59,18 +74,21 @@ def _require_change_reason(body: RevisionCreate | PlanCreate,
             422, "采用保守边界必须在 changes 中给出 "
                  "kind=conservative_bounds 的理由")
     if prev_payload is not None:
-        prev_r = prev_payload.route
-        if [(s.model_dump()) for s in prev_r.spans] \
-                != [s.model_dump() for s in payload.route.spans] \
-                and "span_change" not in kinds:
-            raise HTTPException(422, "修改柔性跨段（端座/支座/预张力/线密度/"
-                                     "弹性参数/限值/过支座能力/容许人数）"
-                                     "必须在 changes 中给出 kind=span_change 的理由")
-        if [(s.model_dump()) for s in prev_r.shuttles] \
-                != [s.model_dump() for s in payload.route.shuttles] \
-                and "shuttle_change" not in kinds:
-            raise HTTPException(422, "更换/修改滑梭必须在 changes 中给出 "
-                                     "kind=shuttle_change 的理由")
+        sig_prev = _structural_route_signature(prev_payload)
+        sig_new = _structural_route_signature(payload)
+        if sig_prev != sig_new:
+            span_changed = sig_prev[0] != sig_new[0] or sig_prev[2] != sig_new[2]
+            shuttle_changed = sig_prev[1] != sig_new[1]
+            if span_changed and "span_change" not in kinds:
+                raise HTTPException(
+                    422, "对柔性跨段/端座/中间支座的重大修改"
+                         "（端座、预张力、线密度、弹性参数、限值、"
+                         "滑梭过支座能力、容许人数等）必须在 changes 中给出 "
+                         "kind=span_change 的理由")
+            if shuttle_changed and "shuttle_change" not in kinds:
+                raise HTTPException(
+                    422, "更换/修改滑梭必须在 changes 中给出 "
+                         "kind=shuttle_change 的理由")
 
 
 # ---------------------------------------------------------------- 方案
@@ -145,11 +163,25 @@ def get_analysis(plan_id: str, rev_no: int, store: Store = Depends(get_store)):
 @app.put("/plans/{plan_id}/revisions/{rev_no}", response_model=RevisionOut)
 def update_revision(plan_id: str, rev_no: int, body: RevisionCreate,
                     store: Store = Depends(get_store)):
-    """覆盖草稿参数；确认稿不可覆盖，返回 409。"""
+    """覆盖草稿参数；确认稿不可覆盖（409）。
+
+    柔性跨段/支座/滑梭的重大结构性修改不得覆盖既有草稿（即便已附
+    span_change 理由）：必须 POST 另存修订，保留旧版冻结参数。
+    点锚、人员、装备、动作次序等非结构参数仍可覆盖草稿。
+    """
     row = _load_revision(store, plan_id, rev_no)
     if row["status"] == "confirmed":
         raise HTTPException(409, "确认稿不可覆盖，请另存修订")
     prev_payload = PlanPayload.model_validate_json(row["payload"])
+    sig_prev = _structural_route_signature(prev_payload)
+    sig_new = _structural_route_signature(body.payload)
+    if sig_prev != sig_new:
+        what = "柔性跨段/端座/中间支座" if sig_prev[0] != sig_new[0] \
+            or sig_prev[2] != sig_new[2] else "滑梭"
+        raise HTTPException(
+            409, f"{what}的重大修改必须另存修订（POST .../revisions）以保留"
+                 f"旧版参数，不允许覆盖既有草稿；请在新修订 changes 中"
+                 f"附 span_change/shuttle_change 理由")
     _require_change_reason(body, body.payload, prev_payload)
     ok = store.update_draft_payload(
         plan_id, rev_no, body.payload.model_dump_json(),

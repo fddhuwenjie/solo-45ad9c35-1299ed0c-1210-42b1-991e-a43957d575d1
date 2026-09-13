@@ -35,7 +35,8 @@ class ReachProvider:
     def __init__(self, n: int, stations: list[Vec],
                  reachable: Callable[[int, Target], bool],
                  last_reach: Callable[[Target, int], int],
-                 capacity_ok: Callable[[int, Target], bool],
+                 attach_block: Callable[[int, Target, Optional[Target]],
+                                        Optional[tuple[str, dict]]],
                  occupy: Callable[[int, Target], None],
                  targets: list[Target],
                  pos_fn: Callable[[int], Vec3],
@@ -48,7 +49,11 @@ class ReachProvider:
         self.stations = stations
         self.reachable = reachable
         self.last_reach = last_reach
-        self.capacity_ok = capacity_ok
+        # attach_block(i, target, other_hook_target) -> None 表示可挂；
+        # 否则返回 (code, components)，code 为
+        # duplicate_occupancy（本人另一钩已占用 / 容量被重复占用，不下结论）
+        # 或 capacity_full（点锚共用上限，按旧语义判失效）。
+        self.attach_block = attach_block
         self.occupy = occupy
         self.targets = targets
         self.pos_fn = pos_fn
@@ -61,19 +66,46 @@ class ReachProvider:
     def reach_set(self, i: int) -> set[Target]:
         return {t for t in self.targets if self.reachable(i, t)}
 
-    def candidates(self, i: int, *, require_forward: bool = False) -> list[Target]:
-        """站点 i 可建立连接的目标：可达且不超共用限制，按前向覆盖、距离排序。"""
+    def candidates(self, i: int, *, require_forward: bool = False,
+                   other: Target | None = None) -> list[Target]:
+        """站点 i 可建立连接的目标：可达、无占用阻塞、（可选）前向覆盖，
+        按前向覆盖、距离、点锚优先排序。other 为本人另一钩当前目标，
+        与其重复的滑梭目标不可再挂。"""
         out = []
         for t in self.reach_set(i):
-            if not self.capacity_ok(i, t):
+            if self.attach_block(i, t, other) is not None:
                 continue
             if require_forward and self.last_reach(t, i) <= i:
                 continue
             kind, tid = t
             d = g.dist3(self.stations[i], self.target_pos(i, t))
-            out.append((-self.last_reach(t, i), d, 0 if kind == "anchor" else 1, t))
+            # 同前向覆盖、同距离时点锚优先（0 < 1）
+            out.append((0 if kind == "anchor" else 1,
+                        -self.last_reach(t, i), d, t))
         out.sort()
         return [t for *_x, t in out]
+
+    def first_block(self, i: int, other: Target | None = None
+                    ) -> tuple[Target, str, dict] | None:
+        """可达目标中最早序的阻塞原因（无可挂目标时用于分类上报）。"""
+        best = None
+        for t in sorted(self.reach_set(i)):
+            blk = self.attach_block(i, t, other)
+            if blk is not None and (best is None or blk[0] < best[1]):
+                best = (t, blk[0], blk[1])
+        return best
+
+    def first_forward_block(self, i: int, other: Target | None
+                            ) -> tuple[Target, str, dict] | None:
+        """前向（下一站仍可达）目标中的占用阻塞，用于无候选时分类上报。"""
+        best = None
+        for t in sorted(self.reach_set(i)):
+            if self.last_reach(t, i) <= i:
+                continue
+            blk = self.attach_block(i, t, other)
+            if blk is not None and (best is None or blk[0] < best[1]):
+                best = (t, blk[0], blk[1])
+        return best
 
 
 def _ev(station_index: int, pos: Vec3, person_id: str, action: str, hook: str,
@@ -113,6 +145,33 @@ def _tgt_name(t: Target | None) -> str:
 
 def _has_flex(hooks: dict) -> bool:
     return any(t is not None and t[0] == "shuttle" for t in hooks.values())
+
+
+def _jammed_open(res: PersonSequence, prov: "ReachProvider", person: Person,
+                 n: int, i: int, action: str, hook: str,
+                 t: Target, k: int) -> None:
+    """记录 shuttle_jammed open item 并终止该人后续结论。"""
+    span_id = prov.shuttle_span(t[1])
+    sups = prov.span_supports(span_id)
+    res.open_items.append(OpenItem(
+        station_index=i, position=prov.pos_fn(i), person_id=person.id,
+        action=action, code="shuttle_jammed",
+        message=f"滑梭 {t[1]} 无法通过跨段 {span_id} "
+                f"中间支座 {sups[k]}，滑梭将卡在支座处",
+        components={"failing_hook": hook, "shuttle": t[1], "span": span_id,
+                    "blocked_support_index": k,
+                    "blocked_support_id": sups[k]}))
+    res.states.extend([None] * (n - len(res.states)))
+
+
+def _dup_occupy_open(res: PersonSequence, prov: "ReachProvider",
+                     person: Person, n: int, i: int, action: str,
+                     hook: str | None, comp: dict, msg: str) -> None:
+    res.open_items.append(OpenItem(
+        station_index=i, position=prov.pos_fn(i), person_id=person.id,
+        action=action, code="duplicate_occupancy", message=msg,
+        components={**comp, **({"failing_hook": hook} if hook else {})}))
+    res.states.extend([None] * (n - len(res.states)))
 
 
 def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
@@ -161,6 +220,17 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
     c0 = prov.candidates(0)
     if not c0:
         reach = prov.reach_set(0)
+        blk = prov.first_block(0)
+        if blk is not None and blk[1] == "duplicate_occupancy":
+            t, _code, comp = blk
+            res.open_items.append(OpenItem(
+                station_index=0, position=pos(0), person_id=person.id,
+                action="attach", code="duplicate_occupancy",
+                message=f"滑梭 {t[1]} 已被占用，双钩重复挂接同一滑梭"
+                        f"（重复占用），不下结论",
+                components=comp))
+            res.states.extend([None] * n)
+            return res
         if reach or any(t[0] == "shuttle" for t in prov.targets):
             break_or_fail(
                 0, "attach",
@@ -179,10 +249,27 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
     hooks["A"] = c0[0]
     res.events.append(_ev(0, pos(0), person.id, "attach", "A", None, c0[0], hooks))
     refresh()
-    others = [t for t in c0 if t != c0[0]]
-    hooks["B"] = others[0] if others else c0[0]
-    res.events.append(_ev(0, pos(0), person.id, "attach", "B", None, hooks["B"], hooks))
-    refresh()
+    # B 钩不得与 A 钩重复挂同一滑梭；重复占用即不下结论
+    cB = prov.candidates(0, other=hooks["A"])
+    if not cB:
+        blk = prov.first_block(0, other=hooks["A"])
+        if blk is not None and blk[1] == "duplicate_occupancy":
+            t, _code, comp = blk
+            res.open_items.append(OpenItem(
+                station_index=0, position=pos(0), person_id=person.id,
+                action="attach", code="duplicate_occupancy",
+                message=f"B 钩只能与 A 钩重复挂到滑梭 {t[1]}"
+                        f"（重复占用），双钩不独立，不下结论",
+                components={**comp, "failing_hook": "B"}))
+            res.states.extend([None] * n)
+            return res
+        # 无其他可达目标：单钩起步继续（自动算法按单连接推进）
+        hooks["B"] = None
+    else:
+        hooks["B"] = cB[0]
+        res.events.append(_ev(0, pos(0), person.id, "attach", "B", None,
+                              hooks["B"], hooks))
+        refresh()
 
     # ---- 沿站推进 ------------------------------------------------------
     for i in range(n):
@@ -213,26 +300,24 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
                 if cur[0] == "shuttle":
                     k = prov.crosses_blocked(cur[1], i, i + 1)
                     if k is not None:
-                        span_id = prov.shuttle_span(cur[1])
-                        sups = prov.span_supports(span_id)
-                        res.open_items.append(OpenItem(
-                            station_index=i, position=pos(i),
-                            person_id=person.id, action="traverse",
-                            code="shuttle_jammed",
-                            message=f"滑梭 {cur[1]} 无法通过跨段 {span_id} "
-                                    f"中间支座 {sups[k]}，滑梭将卡在支座处",
-                            components={"failing_hook": h, "shuttle": cur[1],
-                                        "span": span_id,
-                                        "blocked_support_index": k,
-                                        "blocked_support_id": sups[k]}))
-                        res.states.extend([None] * (n - len(res.states)))
+                        _jammed_open(res, prov, person, n, i, "traverse",
+                                     h, cur, k)
                         return res
                 if prov.reachable(i + 1, cur):
                     continue
-                # 该钩下一站将脱开，必须当前站换钩（另一钩保持连接）
-                cand = prov.candidates(i, require_forward=True)
+                # 该钩下一站将脱开，必须当前站换钩（另一钩保持连接）；
+                # 目标不得与另一钩重复占用同一滑梭
+                other = hooks["B" if h == "A" else "A"]
+                cand = prov.candidates(i, require_forward=True, other=other)
                 if not cand:
-                    other = hooks["B" if h == "A" else "A"]
+                    blk = prov.first_forward_block(i, other)
+                    if blk is not None and blk[1] == "duplicate_occupancy":
+                        bt, _code, bcomp = blk
+                        _dup_occupy_open(
+                            res, prov, person, n, i, "switch", h, bcomp,
+                            f"该钩只能重复挂到另一钩已占用的滑梭 {bt[1]}"
+                            f"（重复占用），双钩不独立，不下结论")
+                        return res
                     comp = {"current_anchor": _id_kind(cur, "anchor"),
                             "current_target": _tid(cur),
                             "other_hook_target": _tid(other),
@@ -250,9 +335,9 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
                 refresh()
 
         res.states.append((hooks["A"], hooks["B"]))
-        for t in {hooks["A"], hooks["B"]}:
-            if t:
-                prov.occupy(i, t)
+        for h in ("A", "B"):
+            if hooks[h]:
+                prov.occupy(i, hooks[h], h)
 
     # ---- 终点解钩 ------------------------------------------------------
     for h in ("A", "B"):
@@ -300,7 +385,22 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
         return [h for h in ("A", "B")
                 if hooks[h] is not None and prov.reachable(i, hooks[h])]
 
+    # 每站处理完动作后实际生效的挂接（用于过支座检查；不依赖中间态）
+    attached_at: list[dict[str, Target | None]] = []
+
     for i in range(n):
+        # 进站：上一站已挂的滑梭若随人员越过不可通过的中间支座 → 卡支座
+        if attached_at:
+            prev = attached_at[-1]
+            for h in ("A", "B"):
+                cur = prev.get(h)
+                if cur is not None and cur[0] == "shuttle":
+                    k = prov.crosses_blocked(cur[1], i - 1, i)
+                    if k is not None:
+                        _jammed_open(res, prov, person, n, i, "traverse",
+                                     h, cur, k)
+                        return res
+
         if any(hooks.values()) and not live(i):
             comp = {"hook_A": _tid(hooks["A"]), "hook_B": _tid(hooks["B"]),
                     "reachable_targets": _fmt(prov.reach_set(i))}
@@ -340,17 +440,19 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                                "target_shuttle": act.shuttle or "",
                                "reachable_targets": _fmt(prov.reach_set(i))}, h)
                     return res
-                if not prov.capacity_ok(i, tgt):
-                    if tgt[0] == "shuttle":
-                        res.open_items.append(OpenItem(
-                            station_index=i, position=pos(i),
-                            person_id=person.id, action=act.action,
-                            code="duplicate_occupancy",
-                            message=f"滑梭 {tgt[1]} 容量已满，重复占用"
-                                    f"（同梭重复挂接），无法由本核算判定",
-                            components={"failing_hook": h,
-                                        "target_shuttle": tgt[1]}))
-                        res.states.extend([None] * (n - len(res.states)))
+                other_t = hooks["B" if h == "A" else "A"]
+                blk = prov.attach_block(i, tgt, other_t)
+                if blk is not None:
+                    code, bcomp = blk
+                    if code == "duplicate_occupancy":
+                        if tgt[0] == "shuttle" and other_t == tgt:
+                            msg = (f"A/B 钩在同一站重复挂到同一滑梭 {tgt[1]}"
+                                   f"（重复占用），双钩不独立，不下结论")
+                        else:
+                            msg = (f"滑梭 {tgt[1]} 已被占满，重复占用，"
+                                   f"无法由本核算判定")
+                        _dup_occupy_open(res, prov, person, n, i,
+                                         act.action, h, bcomp, msg)
                     else:
                         cap = prov.anchor_max_users(tgt[1])
                         hook_fail(i, act.action,
@@ -405,9 +507,10 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
             return res
 
         res.states.append((hooks["A"], hooks["B"]))
-        for t in {hooks["A"], hooks["B"]}:
-            if t:
-                prov.occupy(i, t)
+        attached_at.append(dict(hooks))
+        for h in ("A", "B"):
+            if hooks[h]:
+                prov.occupy(i, hooks[h], h)
 
     leftover = [a for kk, acts in by_station.items() if kk >= n for a in acts]
     if leftover:
