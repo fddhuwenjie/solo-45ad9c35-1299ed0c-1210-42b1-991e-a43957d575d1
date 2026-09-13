@@ -226,6 +226,48 @@ def test_related_route_change_marks_only_recheck(client):
     assert out2["recheck_required"] is False
 
 
+def test_stretcher_only_obstacle_marks_confirmed_recheck(client):
+    """回归：相关路线修订新增只影响担架走廊的障碍物、最新结果出现
+    casualty_path_blocked 时，已确认方案必须待复核，不再提供过期的
+    可执行结论（确认结果仍锁定 r1 冻结快照）。"""
+    plan_id = _plan(client, confirm=True)
+    # 向侧向落点转运，担架走廊沿 +y 展开
+    landing = {"x": 0, "y": 3, "z": 0}
+    r = _rescue(client, plan_id, landing=landing)
+    rid = r.json()["rescue_id"]
+    assert r.json()["result"]["executable"] is True
+    client.post(f"/rescue/{rid}/revisions/1/confirm")
+
+    # 原路线新增修订：障碍物只横在担架走廊（y∈[1,3]），
+    # 不影响 y≈0 的人员坠落/摆坠，来源路线仍可通行
+    changed = copy.deepcopy(passable_payload())
+    changed["route"]["obstacles"] = [
+        {"kind": "box", "id": "stretcher_gate",
+         "min": {"x": -1.0, "y": 1.0, "z": -1.2},
+         "max": {"x": 1.0, "y": 3.0, "z": -0.5}}]
+    r = client.post(f"/plans/{plan_id}/revisions",
+                    json={"note": "走廊增设管线", "payload": changed})
+    assert r.status_code == 201, r.text
+    assert r.json()["analysis"]["passable"] is True
+
+    out = client.get(f"/rescue/{rid}/revisions/1").json()
+    assert out["recheck_required"] is True
+    assert "r2" in out["recheck_reason"]
+    # 冻结快照结果仍按 r1（无障碍）计算：确认结论不被静默改写
+    assert out["source_rev_no"] == 1
+    assert out["result"]["executable"] is True
+
+    # 若直接按最新路线（确认 r2 后）登记方案，最新结果确为担架路径受阻
+    client.post(f"/plans/{plan_id}/revisions/2/confirm")
+    rid2 = client.post(
+        f"/plans/{plan_id}/revisions/2/rescue",
+        json={"name": "新", "note": "",
+              "payload": rescue_payload(landing=landing)})
+    assert rid2.status_code == 201
+    assert rid2.json()["result"]["earliest_block"]["code"] \
+        == "casualty_path_blocked"
+
+
 def test_rescue_plan_listing(client):
     plan_id = _plan(client)
     _rescue(client, plan_id)

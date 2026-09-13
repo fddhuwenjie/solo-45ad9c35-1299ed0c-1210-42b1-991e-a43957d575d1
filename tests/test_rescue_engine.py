@@ -1,11 +1,13 @@
 """坠落后救援推演引擎测试：逐步分量、最早受阻步骤、来源冻结与相关性。"""
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from app.engine import build_context
 from app.engine.rescue import simulate_rescue, source_relevance_signature
-from app.models import PlanPayload, RescuePayload
+from app.models import ObstacleBox, PlanPayload, RescuePayload, Vec3
 
 from .scenarios import (clearance_payload, flex_missing_params_payload,
                         flex_passable_payload, hook_chain_break_payload,
@@ -166,7 +168,6 @@ def test_manual_choice_requires_reason():
 
 def test_manual_choice_recorded_in_result():
     # 短路线 + 加大挂接距离：人工指定 x=0 处的双锚在全部站点可达
-    import copy
     plan = copy.deepcopy(passable_payload())
     plan["route"]["walk_polyline"] = [
         {"x": 0, "y": 0, "z": 0}, {"x": 1.5, "y": 0, "z": 0}]
@@ -202,10 +203,39 @@ def test_hook_chain_break_has_no_suspension_after_failure():
     assert all(s.station_index < 21 for s in res.simulations)
 
 
+def test_auto_rope_uses_each_candidate_own_ratio_and_efficiency():
+    """回归：自动选绳必须按各候选绳组自身的倍率/效率核算牵引力。
+
+    存在可行的 5:1 RT1（牵引 0.21 kN）时，短而低效的 1:1 RT0
+    （牵引 0.83 kN > 0.5 kN）不得因"绳长最短"被误选并报
+    manual_pull_exceeded。
+    """
+    body = rescue_payload()
+    body["rope_teams"] = [
+        {"id": "RT0", "rope_length_m": 6.0, "pulley_ratio": 1,
+         "pulley_efficiency": 1.0, "descender_limit_kn": 2.5},
+        {"id": "RT1", "rope_length_m": 60.0, "pulley_ratio": 5,
+         "pulley_efficiency": 0.8, "descender_limit_kn": 2.5},
+        {"id": "RT2", "rope_length_m": 20.0, "pulley_ratio": 1,
+         "pulley_efficiency": 1.0, "descender_limit_kn": 2.5},
+    ]
+    body["secondary_rope_team_id"] = "RT2"
+    res = simulate_rescue(_ctx(passable_payload()),
+                          RescuePayload.model_validate(body))
+    assert res.executable is True
+    assert res.earliest_block is None
+    # 全部站点均选用可行的 5:1 RT1，未误选 1:1 RT0
+    assert res.simulations
+    assert all(s.rope_team_id == "RT1" for s in res.simulations)
+    haul = next(x for x in res.simulations[0].steps
+                if x.code == "haul_unload")
+    assert haul.components["pulley_ratio"] == 5
+    assert haul.pull_force_kn <= 0.5
+
+
 # ---------------------------------------------------------------- 相关性签名
 
 def test_relevance_signature_changes_only_with_related_route():
-    import copy
     plan = PlanPayload.model_validate(passable_payload())
     res = simulate_rescue(build_context(plan), _rp())
     sig0 = source_relevance_signature(plan, res)
@@ -223,3 +253,28 @@ def test_relevance_signature_changes_only_with_related_route():
     changed = copy.deepcopy(plan)
     changed.route.anchors[0].rated_load_kn = 99.0
     assert source_relevance_signature(changed, res) != sig0
+
+
+def test_signature_changes_with_stretcher_only_obstacle():
+    """回归：只影响担架轨迹走廊、不影响人员坠落的障碍物也须进入签名。"""
+    # 救援向侧向落点 (0,3,0) 转运，走廊沿 +y 展开
+    rp = _rp(landing={"x": 0, "y": 3, "z": 0})
+    res = simulate_rescue(_ctx(passable_payload()), rp)
+    assert res.executable is True
+    plan = PlanPayload.model_validate(passable_payload())
+    sig0 = source_relevance_signature(plan, res, rp)
+    assert sig0[-1] == ()                        # 走廊内原无障碍
+
+    # 新增障碍物只横在担架转运走廊（y∈[1,3]），不在 y≈0 人员坠落路径
+    changed = copy.deepcopy(plan)
+    changed.route.obstacles.append(ObstacleBox(
+        id="stretcher_gate",
+        min=Vec3(x=-1.0, y=1.0, z=-1.2),
+        max=Vec3(x=1.0, y=3.0, z=-0.5)))
+    # 来源路线仍可通行（人员坠落/摆坠扫掠在 y≈0，不触及该障碍）
+    assert build_context(changed).result.passable is True
+    res2 = simulate_rescue(build_context(changed), rp)
+    # 担架包络（外接球半径约 1.06 m）被阻
+    assert res2.executable is False
+    assert res2.earliest_block.code == "casualty_path_blocked"
+    assert source_relevance_signature(changed, res2, rp) != sig0

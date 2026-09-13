@@ -610,6 +610,9 @@ class StationRescue(BaseModel):
     executable: bool
     block: Optional[RescueBlock] = None
     steps: list[RescueStep] = []
+    corridor_obstacles: list[str] = Field(
+        default_factory=list,
+        description="提拉/转运轨迹走廊内影响担架净空的障碍物 id")
     total_elapsed_minutes: float = 0.0
 
 

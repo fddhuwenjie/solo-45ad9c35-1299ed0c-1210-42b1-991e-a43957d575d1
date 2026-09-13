@@ -167,8 +167,9 @@ def _shuttle_components(ctx, station, person, eq, anchor_z, sag):
 
 # ---------------------------------------------------------------- 轨迹净空
 
-def _path_obstructed(p0: Vec, p1: Vec, radius: float, route) -> str | None:
-    """球体（担架包络外接球）沿直线 p0→p1 移动，与障碍物求交。"""
+def _path_hits(p0: Vec, p1: Vec, radius: float, route) -> list[str]:
+    """球体沿直线 p0→p1 移动时与之相交的全部障碍物 id（含担架走廊净空）。"""
+    hits: list[str] = []
     d = g.dist3(p0, p1)
     n = max(2, math.ceil(d / 0.5))
     for k in range(n + 1):
@@ -177,15 +178,23 @@ def _path_obstructed(p0: Vec, p1: Vec, radius: float, route) -> str | None:
              p0[1] + (p1[1] - p0[1]) * t,
              p0[2] + (p1[2] - p0[2]) * t)
         for ob in route.obstacles:
+            if ob.id in hits:
+                continue
             if ob.kind == "box":
-                if g.sphere_box_hit(c, radius, ob.min.as_tuple(),
-                                    ob.max.as_tuple()):
-                    return ob.id
+                hit = g.sphere_box_hit(c, radius, ob.min.as_tuple(),
+                                       ob.max.as_tuple())
             else:
-                if g.sphere_cylinder_hit(c, radius, ob.base.as_tuple(),
-                                         ob.radius, ob.height):
-                    return ob.id
-    return None
+                hit = g.sphere_cylinder_hit(c, radius, ob.base.as_tuple(),
+                                            ob.radius, ob.height)
+            if hit:
+                hits.append(ob.id)
+    return hits
+
+
+def _path_obstructed(p0: Vec, p1: Vec, radius: float, route) -> str | None:
+    """球体（担架包络外接球）沿直线 p0→p1 移动，返回首个相撞障碍物。"""
+    hits = _path_hits(p0, p1, radius, route)
+    return hits[0] if hits else None
 
 
 # ---------------------------------------------------------------- 单站推演
@@ -255,6 +264,9 @@ def _simulate_station(ctx, rp: RescuePayload, i: int, person: Person, eq,
     # 伤员 D 环悬挂位置：动态锚点正下方、展开绳长处
     d_hang = (hang_pt[0], hang_pt[1], hang_pt[2] - hang.deploy)
     feet0 = hang.feet_z
+    # 提拉/转运轨迹走廊内影响担架净空的障碍物（半径 0：走廊几何，
+    # 担架包络半径在逐步净空检查中另计）
+    corridor: set[str] = set()
 
     try:
         # ---- 步骤 1：接近 ----------------------------------------------
@@ -384,11 +396,16 @@ def _simulate_station(ctx, rp: RescuePayload, i: int, person: Person, eq,
                         "rated_load_kn": backup.rated_load_kn})
         time_check()
 
-        # ---- 主绳组选择（自动：倍率足够且最短；人工指定须写理由） --------
+        # ---- 主绳组选择（自动：各候选按自身倍率/效率核算牵引力，
+        #      可行者取绳长最短；人工指定须写理由） --------------------
         def eff_ma(rt):
             return rt.pulley_ratio * rt.pulley_efficiency
 
-        def choose_rope(need_pull):
+        def candidate_pull(rt):
+            # 该绳组自身滑轮倍率与效率下的人工牵引力
+            return load / max(eff_ma(rt), 1e-9)
+
+        def choose_rope():
             if rp.rope_team_id is not None:
                 rt = ropes[rp.rope_team_id]
                 if rt.id == sec_rope.id:
@@ -397,10 +414,10 @@ def _simulate_station(ctx, rp: RescuePayload, i: int, person: Person, eq,
                         f"主绳组与二次保护绳组同为 {rt.id}（器材重复占用）",
                         {"rope_team": rt.id})
                 return rt
-            cand = [rt for rt in rp.rope_teams
-                    if rt.id != sec_rope.id
-                    and need_pull / max(eff_ma(rt), 1e-9)
-                    <= params.rescuer_pull_kn + 1e-9]
+            eligible = [rt for rt in rp.rope_teams
+                        if rt.id != sec_rope.id]
+            cand = [rt for rt in eligible
+                    if candidate_pull(rt) <= params.rescuer_pull_kn + 1e-9]
             if not cand:
                 return None
             cand.sort(key=lambda rt: (rt.rope_length_m, -eff_ma(rt)))
@@ -411,21 +428,24 @@ def _simulate_station(ctx, rp: RescuePayload, i: int, person: Person, eq,
         stretcher_half = rp.stretcher.height_m / 2.0
         lift = max(0.0, station[2] - feet0) + stretcher_half
         rope_travel = lift
-        # 先试算牵引力以选绳组（主锚在伤员正上方近似竖直提拉）
-        # 取最大倍率估算，仅用于绳组选择
-        best_ma = max(eff_ma(rt) for rt in rp.rope_teams
-                      if rt.id != sec_rope.id)
-        est_pull = load / max(best_ma, 1e-9)
-        main_rope = choose_rope(est_pull)
+        main_rope = choose_rope()
         if main_rope is None:
+            eligible = [rt for rt in rp.rope_teams
+                        if rt.id != sec_rope.id]
+            pulls = {rt.id: round(candidate_pull(rt), 3)
+                     for rt in eligible}
+            best_rt = min(eligible, key=candidate_pull)
             raise _Block(
                 3, "haul_unload", "manual_pull_exceeded",
-                f"伤员+担架载荷 {round(load, 2)} kN，现有绳组倍率下单人持续"
-                f"牵引力均超过 {params.rescuer_pull_kn} kN，无法人工提拉",
+                f"伤员+担架载荷 {round(load, 2)} kN，各候选绳组按自身倍率"
+                f"计算的人工牵引力均超过 {params.rescuer_pull_kn} kN，"
+                f"无法人工提拉",
                 {"load_kn": round(load, 3),
                  "rescuer_pull_kn": params.rescuer_pull_kn,
-                 "best_mechanical_advantage": round(best_ma, 3),
-                 "pull_force_kn": round(est_pull, 3),
+                 "candidate_pulls_kn": ",".join(
+                     f"{k}:{v}" for k, v in sorted(pulls.items())),
+                 "best_mechanical_advantage": round(eff_ma(best_rt), 3),
+                 "pull_force_kn": round(candidate_pull(best_rt), 3),
                  "rescuer_count": len(rp.rescuers)})
         ma = eff_ma(main_rope)
         pull = load / ma
@@ -475,6 +495,8 @@ def _simulate_station(ctx, rp: RescuePayload, i: int, person: Person, eq,
                  "pull_force_kn": round(pull, 3)})
         # 伤员轨迹净空：悬挂点 → 提拉至锚点下方可转运高度
         top_pt = (d_hang[0], d_hang[1], feet0 + lift)
+        corridor.update(_path_hits(d_hang, top_pt,
+                                   person.body_radius_m, route))
         hit = _path_obstructed(d_hang, top_pt,
                                person.body_radius_m, route)
         if hit is not None:
@@ -546,6 +568,7 @@ def _simulate_station(ctx, rp: RescuePayload, i: int, person: Person, eq,
                 {"anchor": primary.id, "resultant_kn": round(trans_f, 3),
                  "rated_load_kn": primary.rated_load_kn})
         radius = rp.stretcher.bounding_radius_m()
+        corridor.update(_path_hits(move_from, move_to, radius, route))
         hit = _path_obstructed(move_from, move_to, radius, route)
         if hit is not None:
             raise _Block(
@@ -599,7 +622,8 @@ def _simulate_station(ctx, rp: RescuePayload, i: int, person: Person, eq,
                 station_index=i, person_id=person.id,
                 step_no=b.step_no, step_code=b.step_code,
                 code=b.code, message=b.message, components=b.components),
-            steps=steps, total_elapsed_minutes=round(t_cum, 3))
+            steps=steps, corridor_obstacles=sorted(corridor),
+            total_elapsed_minutes=round(t_cum, 3))
         return res, False, used_a, used_s
 
     res = StationRescue(
@@ -614,6 +638,7 @@ def _simulate_station(ctx, rp: RescuePayload, i: int, person: Person, eq,
         rope_team_id=main_rope.id,
         secondary_rope_team_id=rp.secondary_rope_team_id,
         executable=True, steps=steps,
+        corridor_obstacles=sorted(corridor),
         total_elapsed_minutes=round(t_cum, 3))
     return res, False, used_a, used_s
 
@@ -736,9 +761,11 @@ def _manual_decisions(rp: RescuePayload) -> list[ManualDecision]:
 # ---------------------------------------------------------------- 相关性签名
 
 def source_relevance_signature(payload: PlanPayload,
-                               result: RescueResult) -> tuple:
-    """来源修订中与本救援方案相关的部分：方案所用人/锚/滑梭/跨段参数与
-    悬挂点几何。仅改步距（站点重新编号、悬挂几何不变）不触发复核。"""
+                               result: RescueResult,
+                               rp: RescuePayload | None = None) -> tuple:
+    """来源修订中与本救援方案相关的部分：方案所用人/锚/滑梭/跨段参数、
+    悬挂点几何与担架轨迹走廊内障碍物。仅改步距（站点重新编号、悬挂几何
+    不变）不触发复核；走廊内新增/修改障碍物（含只影响担架包络者）触发。"""
     pids = set(result.used_persons)
     aids = set(result.used_source_anchors)
     sids = set(result.used_source_shuttles)
@@ -768,4 +795,19 @@ def source_relevance_signature(payload: PlanPayload,
         round(s.hang_position.x, 3), round(s.hang_position.y, 3),
         round(s.hang_position.z, 3), round(s.feet_z, 3))
         for s in result.simulations}))
-    return (persons, equip, anchors, shuttles, spans, supports, hang_geom)
+    # 担架轨迹走廊障碍物：以推演收集到的走廊 id 集合为准（两侧分别按各自
+    # 路线/方案重算），纳入这些障碍物的几何与额定参数。新增只影响担架
+    # 包络（不影响人员坠落）的障碍物即在此处改变签名。
+    corridor_ids = {oid for s in result.simulations
+                    for oid in s.corridor_obstacles}
+    obstacles = tuple(sorted(
+        _obstacle_sig(ob) for ob in payload.route.obstacles
+        if ob.id in corridor_ids))
+    return (persons, equip, anchors, shuttles, spans, supports, hang_geom,
+            obstacles)
+
+
+def _obstacle_sig(ob) -> tuple:
+    if ob.kind == "box":
+        return (ob.id, "box", ob.min.model_dump(), ob.max.model_dump())
+    return (ob.id, "cylinder", ob.base.model_dump(), ob.radius, ob.height)

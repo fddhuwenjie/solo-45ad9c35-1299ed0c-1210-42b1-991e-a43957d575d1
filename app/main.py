@@ -300,7 +300,7 @@ def _recompute_rescue(store: Store, rp_row, rescue_row, source_row,
             latest_result = simulate_rescue(
                 build_context(latest_payload), rp)
             latest_sig = json.loads(json.dumps(
-                source_relevance_signature(latest_payload, latest_result),
+                source_relevance_signature(latest_payload, latest_result, rp),
                 ensure_ascii=False, default=list))
             if frozen_sig != latest_sig:
                 recheck = True
@@ -468,8 +468,9 @@ def confirm_rescue_revision(rescue_id: str, rrev: int,
         "source_note": source_row["note"],
         "source_created_at": source_row["created_at"],
     }, ensure_ascii=False)
-    sig = json.dumps(source_relevance_signature(source_payload, result),
-                     ensure_ascii=False, default=list)
+    sig = json.dumps(
+        source_relevance_signature(source_payload, result, rp_payload),
+        ensure_ascii=False, default=list)
     if not store.confirm_rescue_revision(rescue_id, rrev, snapshot, sig):
         raise HTTPException(409, "确认失败（仅草稿可确认）")
     rr = store.get_rescue_revision(rescue_id, rrev)
