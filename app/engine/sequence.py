@@ -33,7 +33,7 @@ class ReachProvider:
     """提供每站目标可达性、前向覆盖、共用容量、排序位置与滑梭跨支座信息。"""
 
     def __init__(self, n: int, stations: list[Vec],
-                 reachable: Callable[[int, Target], bool],
+                 reachable: Callable[[int, Target, Optional[str]], bool],
                  last_reach: Callable[[Target, int], int],
                  attach_block: Callable[[int, Target, Optional[Target]],
                                         Optional[tuple[str, dict]]],
@@ -44,11 +44,13 @@ class ReachProvider:
                  anchor_max_users: Callable[[str], int],
                  shuttle_span: Callable[[str], str] | None = None,
                  span_supports: Callable[[str], list[str]] | None = None,
-                 crosses_blocked: Callable[[str, int, int], int | None] | None = None):
+                 crosses_blocked: Callable[[str, int, int], int | None] | None = None,
+                 leg_length_shortfall: Callable[[int, Target, str],
+                                                Optional[dict]] | None = None):
         self.n = n
         self.stations = stations
-        self.reachable = reachable
-        self.last_reach = last_reach
+        self.reachable_fn = reachable
+        self.last_reach_fn = last_reach
         # attach_block(i, target, other_hook_target) -> None 表示可挂；
         # 否则返回 (code, components)，code 为
         # duplicate_occupancy（本人另一钩已占用 / 容量被重复占用，不下结论）
@@ -62,17 +64,28 @@ class ReachProvider:
         self.shuttle_span = shuttle_span or (lambda sid: "")
         self.span_supports = span_supports or (lambda sid: [])
         self.crosses_blocked = crosses_blocked or (lambda sid, i0, i1: None)
+        # Y 型双腿系绳：(站, 目标, 钩) -> 腿长不足分量 dict；None 表示不是
+        # 该原因（目标本就不在可达包络内时也返回 None）。
+        self.leg_length_shortfall = leg_length_shortfall \
+            or (lambda i, t, h: None)
 
-    def reach_set(self, i: int) -> set[Target]:
-        return {t for t in self.targets if self.reachable(i, t)}
+    def reachable(self, i: int, t: Target, hook: Optional[str] = None) -> bool:
+        return self.reachable_fn(i, t, hook)
+
+    def reach_set(self, i: int, hook: Optional[str] = None) -> set[Target]:
+        return {t for t in self.targets if self.reachable(i, t, hook)}
+
+    def last_reach(self, t: Target, i: int) -> int:
+        return self.last_reach_fn(t, i)
 
     def candidates(self, i: int, *, require_forward: bool = False,
-                   other: Target | None = None) -> list[Target]:
+                   other: Target | None = None,
+                   hook: Optional[str] = None) -> list[Target]:
         """站点 i 可建立连接的目标：可达、无占用阻塞、（可选）前向覆盖，
         按前向覆盖、距离、点锚优先排序。other 为本人另一钩当前目标，
         与其重复的滑梭目标不可再挂。"""
         out = []
-        for t in self.reach_set(i):
+        for t in self.reach_set(i, hook):
             if self.attach_block(i, t, other) is not None:
                 continue
             if require_forward and self.last_reach(t, i) <= i:
@@ -85,21 +98,23 @@ class ReachProvider:
         out.sort()
         return [t for *_x, t in out]
 
-    def first_block(self, i: int, other: Target | None = None
+    def first_block(self, i: int, other: Target | None = None,
+                    hook: Optional[str] = None
                     ) -> tuple[Target, str, dict] | None:
         """可达目标中最早序的阻塞原因（无可挂目标时用于分类上报）。"""
         best = None
-        for t in sorted(self.reach_set(i)):
+        for t in sorted(self.reach_set(i, hook)):
             blk = self.attach_block(i, t, other)
             if blk is not None and (best is None or blk[0] < best[1]):
                 best = (t, blk[0], blk[1])
         return best
 
-    def first_forward_block(self, i: int, other: Target | None
+    def first_forward_block(self, i: int, other: Target | None,
+                            hook: Optional[str] = None
                             ) -> tuple[Target, str, dict] | None:
         """前向（下一站仍可达）目标中的占用阻塞，用于无候选时分类上报。"""
         best = None
-        for t in sorted(self.reach_set(i)):
+        for t in sorted(self.reach_set(i, hook)):
             if self.last_reach(t, i) <= i:
                 continue
             blk = self.attach_block(i, t, other)
@@ -109,12 +124,13 @@ class ReachProvider:
 
 
 def _ev(station_index: int, pos: Vec3, person_id: str, action: str, hook: str,
-        frm: Target | None, to: Target | None, hooks: dict) -> SequenceEvent:
+        frm: Target | None, to: Target | None, hooks: dict,
+        leg: str | None = None) -> SequenceEvent:
     def part(t: Target | None, kind: str):
         return t[1] if t is not None and t[0] == kind else None
     return SequenceEvent(
         station_index=station_index, position=pos, person_id=person_id,
-        action=action, hook=hook,
+        action=action, hook=hook, leg=leg,
         from_anchor=part(frm, "anchor"), to_anchor=part(to, "anchor"),
         from_shuttle=part(frm, "shuttle"), to_shuttle=part(to, "shuttle"),
         attached_after=sorted({t[1] for t in hooks.values()
@@ -176,9 +192,16 @@ def _dup_occupy_open(res: PersonSequence, prov: "ReachProvider",
 
 def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
                    ) -> PersonSequence:
-    """为一名人员自动生成双钩序列（点锚 + 滑梭混合）。"""
+    """为一名人员自动生成双钩序列（点锚 + 滑梭混合）。
+
+    Y 型双腿系绳：每钩只按其绑定实体腿的长度建立/保持连接；某钩因该腿
+    长度不足而无目标可续时记 leg_length_insufficient 失效（不再混入
+    换挂链断开/连续性断开）。
+    """
     n = prov.n
     res = PersonSequence(person_id=person.id)
+    twin = eq.twin_leg
+    leg_id = {h: twin.leg_for_hook(h).id for h in ("A", "B")} if twin else None
 
     def pos(i: int) -> Vec3:
         return prov.pos_fn(i)
@@ -193,17 +216,34 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
                 {t[1] for t in hooks.values()
                  if t is not None and t[0] == "shuttle"})
 
+    def leg_short_fail(i: int, action: str, hook: str | None, comp, msg):
+        res.failures.append(CheckFailure(
+            station_index=i, position=pos(i), person_id=person.id,
+            action=action, check="leg_length_insufficient", message=msg,
+            components={**comp, **({"failing_hook": hook} if hook else {})}))
+        res.states.extend([None] * (n - len(res.states)))
+
+    def any_leg_shortfall(i: int, hook: str) -> Optional[dict] | None:
+        """该钩绑定腿在站 i 是否仅因腿长不足而对所有可换目标失败。"""
+        best = None
+        for t in sorted(prov.targets):
+            sf = prov.leg_length_shortfall(i, t, hook)
+            if sf is not None and (best is None
+                                   or sf["shortfall_m"] > best["shortfall_m"]):
+                best = sf
+        return best
+
     hooks: dict[str, Target | None] = {"A": None, "B": None}
 
     def live(i: int) -> list[str]:
         return [h for h in ("A", "B")
-                if hooks[h] is not None and prov.reachable(i, hooks[h])]
+                if hooks[h] is not None and prov.reachable(i, hooks[h], h)]
 
     def break_or_fail(i: int, action: str, comp: dict, msg_anchor: str,
                       msg_flex: str, hook=None):
         """无目标可续：体系含滑梭 → continuity_break（不下结论）；纯点锚 → 失效。"""
         flex = _has_flex(hooks) or any(
-            t[0] == "shuttle" for t in prov.reach_set(i))
+            t[0] == "shuttle" for t in prov.reach_set(i, hook))
         if flex:
             res.open_items.append(OpenItem(
                 station_index=i, position=pos(i), person_id=person.id,
@@ -217,10 +257,19 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
         res.states.extend([None] * (n - len(res.states)))
 
     # ---- 起步挂接 ------------------------------------------------------
-    c0 = prov.candidates(0)
+    c0 = prov.candidates(0, hook="A")
     if not c0:
-        reach = prov.reach_set(0)
-        blk = prov.first_block(0)
+        reach = prov.reach_set(0, "A")
+        if twin is not None:
+            sf = any_leg_shortfall(0, "A")
+            if sf is not None:
+                leg_short_fail(0, "attach", "A", sf,
+                               f"起点无目标在 A 钩绑定实体腿 "
+                               f"{leg_id['A']} 的触及范围内：最近目标 "
+                               f"{sf['target']} 超出 {round(sf['shortfall_m'], 3)} m，"
+                               f"该腿长度不足，不得标为可通行")
+                return res
+        blk = prov.first_block(0, hook="A")
         if blk is not None and blk[1] == "duplicate_occupancy":
             t, _code, comp = blk
             res.open_items.append(OpenItem(
@@ -237,7 +286,7 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
                 {"reachable_targets": _fmt(reach)},
                 "起点无可到达锚点，无法建立首个有效连接",
                 "起点无法在柔性跨段上建立有效连接（连续性断开），"
-                "是否可通行无法由本核算判定")
+                "是否可通行无法由本核算判定", hook="A")
         else:
             res.failures.append(CheckFailure(
                 station_index=0, position=pos(0), person_id=person.id,
@@ -247,12 +296,23 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
             res.states.extend([None] * n)
         return res
     hooks["A"] = c0[0]
-    res.events.append(_ev(0, pos(0), person.id, "attach", "A", None, c0[0], hooks))
+    res.events.append(_ev(0, pos(0), person.id, "attach", "A", None,
+                          c0[0], hooks,
+                          leg_id["A"] if leg_id else None))
     refresh()
     # B 钩不得与 A 钩重复挂同一滑梭；重复占用即不下结论
-    cB = prov.candidates(0, other=hooks["A"])
+    cB = prov.candidates(0, other=hooks["A"], hook="B")
     if not cB:
-        blk = prov.first_block(0, other=hooks["A"])
+        if twin is not None:
+            sf = any_leg_shortfall(0, "B")
+            if sf is not None:
+                leg_short_fail(0, "attach", "B", sf,
+                               f"起点无目标在 B 钩绑定实体腿 "
+                               f"{leg_id['B']} 的触及范围内：最近目标 "
+                               f"{sf['target']} 超出 {round(sf['shortfall_m'], 3)} m，"
+                               f"该腿长度不足，不得标为可通行")
+                return res
+        blk = prov.first_block(0, other=hooks["A"], hook="B")
         if blk is not None and blk[1] == "duplicate_occupancy":
             t, _code, comp = blk
             res.open_items.append(OpenItem(
@@ -268,7 +328,8 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
     else:
         hooks["B"] = cB[0]
         res.events.append(_ev(0, pos(0), person.id, "attach", "B", None,
-                              hooks["B"], hooks))
+                              hooks["B"], hooks,
+                              leg_id["B"] if leg_id else None))
         refresh()
 
     # ---- 沿站推进 ------------------------------------------------------
@@ -303,14 +364,26 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
                         _jammed_open(res, prov, person, n, i, "traverse",
                                      h, cur, k)
                         return res
-                if prov.reachable(i + 1, cur):
+                if prov.reachable(i + 1, cur, h):
                     continue
                 # 该钩下一站将脱开，必须当前站换钩（另一钩保持连接）；
                 # 目标不得与另一钩重复占用同一滑梭
                 other = hooks["B" if h == "A" else "A"]
-                cand = prov.candidates(i, require_forward=True, other=other)
+                cand = prov.candidates(i, require_forward=True, other=other,
+                                       hook=h)
                 if not cand:
-                    blk = prov.first_forward_block(i, other)
+                    if twin is not None:
+                        sf = any_leg_shortfall(i, h)
+                        if sf is not None:
+                            leg_short_fail(
+                                i, "switch", h, sf,
+                                f"{h} 钩绑定实体腿 {leg_id[h]} 长度不足："
+                                f"当前站可续目标 {sf['target']} "
+                                f"超出该腿触及范围 "
+                                f"{round(sf['shortfall_m'], 3)} m，"
+                                f"继续行进该钩将无法保持连接")
+                            return res
+                    blk = prov.first_forward_block(i, other, h)
                     if blk is not None and blk[1] == "duplicate_occupancy":
                         bt, _code, bcomp = blk
                         _dup_occupy_open(
@@ -321,7 +394,7 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
                     comp = {"current_anchor": _id_kind(cur, "anchor"),
                             "current_target": _tid(cur),
                             "other_hook_target": _tid(other),
-                            "reachable_targets": _fmt(prov.reach_set(i))}
+                            "reachable_targets": _fmt(prov.reach_set(i, h))}
                     break_or_fail(
                         i, "switch", comp,
                         f"锚点 {cur[1]} 即将超出触及范围，且当前站无锚点可换挂："
@@ -330,7 +403,9 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
                         f"无可续目标，柔性体系连续性断开，无法判定", h)
                     return res
                 tgt = cand[0]
-                res.events.append(_ev(i, pos(i), person.id, "switch", h, cur, tgt, hooks))
+                res.events.append(_ev(i, pos(i), person.id, "switch", h,
+                                      cur, tgt, hooks,
+                                      leg_id[h] if leg_id else None))
                 hooks[h] = tgt
                 refresh()
 
@@ -344,16 +419,24 @@ def build_sequence(person: Person, eq: Equipment, prov: ReachProvider
         if hooks[h] is not None:
             old = hooks[h]
             hooks[h] = None
-            res.events.append(_ev(n - 1, pos(n - 1), person.id, "detach", h, old, None, hooks))
+            res.events.append(_ev(n - 1, pos(n - 1), person.id, "detach", h,
+                                  old, None, hooks,
+                                  leg_id[h] if leg_id else None))
             refresh()
     return res
 
 
 def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                     actions: list[ManualHookAction]) -> PersonSequence:
-    """按人工给定次序回放挂接动作并逐站校验（目标可为点锚或滑梭）。"""
+    """按人工给定次序回放挂接动作并逐站校验（目标可为点锚或滑梭）。
+
+    Y 型双腿系绳：人工动作给出的实体腿必须与该钩绑定一致；每钩只按其
+    绑定实体腿的长度判定触及，腿长不足记 leg_length_insufficient 失效。
+    """
     n = prov.n
     res = PersonSequence(person_id=person.id)
+    twin = eq.twin_leg
+    leg_id = {h: twin.leg_for_hook(h).id for h in ("A", "B")} if twin else None
 
     def pos(i: int) -> Vec3:
         return prov.pos_fn(i)
@@ -368,12 +451,21 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                 {t[1] for t in hooks.values()
                  if t is not None and t[0] == "shuttle"})
 
-    def hook_fail(i, action, msg, comp, hook=None):
+    def hook_fail(i, action, msg, comp, hook=None,
+                  check: str = "hook_chain"):
         res.failures.append(CheckFailure(
             station_index=i, position=pos(i), person_id=person.id,
-            action=action, check="hook_chain", message=msg,
+            action=action, check=check, message=msg,
             components={**comp, **({"failing_hook": hook} if hook else {})}))
         res.states.extend([None] * (n - len(res.states)))
+
+    def leg_short_fail(i, action, hook, sf):
+        hook_fail(i, action,
+                  f"{hook} 钩绑定实体腿 {leg_id[hook]} 长度不足：目标 "
+                  f"{sf['target']} 超出该腿触及范围 "
+                  f"{round(sf['shortfall_m'], 3)} m，"
+                  f"不得标为可通行", sf, hook,
+                  check="leg_length_insufficient")
 
     by_station: dict[int, list[ManualHookAction]] = {}
     for act in actions:
@@ -383,7 +475,7 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
 
     def live(i: int) -> list[str]:
         return [h for h in ("A", "B")
-                if hooks[h] is not None and prov.reachable(i, hooks[h])]
+                if hooks[h] is not None and prov.reachable(i, hooks[h], h)]
 
     # 每站处理完动作后实际生效的挂接（用于过支座检查；不依赖中间态）
     attached_at: list[dict[str, Target | None]] = []
@@ -402,14 +494,14 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                         return res
 
         if any(hooks.values()) and not live(i):
-            comp = {"hook_A": _tid(hooks["A"]), "hook_B": _tid(hooks["B"]),
-                    "reachable_targets": _fmt(prov.reach_set(i))}
+            comp = {"hook_A": _tid(hooks["A"]), "hook_B": _tid(hooks["B"])}
             if _has_flex(hooks):
                 res.open_items.append(OpenItem(
                     station_index=i, position=pos(i), person_id=person.id,
                     action="traverse", code="continuity_break",
                     message="行进至当前站时已无有效连接，柔性体系连续性断开",
                     components=comp))
+                res.states.extend([None] * (n - len(res.states)))
             else:
                 hook_fail(i, "traverse",
                           "行进至当前站时已无有效连接（换挂链断开）", comp)
@@ -417,9 +509,16 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
 
         for act in by_station.get(i, []):
             h = act.hook
+            if twin is not None and act.leg is not None \
+                    and act.leg != leg_id[h]:
+                hook_fail(i, act.action,
+                          f"{h} 钩绑定实体腿 {leg_id[h]}，人工动作不得换挂到"
+                          f"腿 {act.leg}（钩腿绑定不得交叉）",
+                          {"bound_leg": leg_id[h], "requested_leg": act.leg}, h)
+                return res
             if act.action == "detach":
                 other = "B" if h == "A" else "A"
-                if hooks[other] is None or not prov.reachable(i, hooks[other]):
+                if hooks[other] is None or not prov.reachable(i, hooks[other], other):
                     hook_fail(i, "detach",
                              f"解钩 {h} 后另一钩无有效连接，不允许松开",
                              {"other_hook_anchor":
@@ -429,16 +528,24 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                     return res
                 old = hooks[h]
                 hooks[h] = None
-                res.events.append(_ev(i, pos(i), person.id, "detach", h, old, None, hooks))
+                res.events.append(_ev(i, pos(i), person.id, "detach", h,
+                                      old, None, hooks,
+                                      leg_id[h] if leg_id else None))
             else:
                 tgt: Target = ("shuttle", act.shuttle) if act.shuttle \
                     else ("anchor", act.anchor)
-                if not prov.reachable(i, tgt):
+                if not prov.reachable(i, tgt, h):
+                    if twin is not None:
+                        sf = prov.leg_length_shortfall(i, tgt, h)
+                        if sf is not None:
+                            leg_short_fail(i, act.action, h, sf)
+                            return res
                     hook_fail(i, act.action,
                               f"目标 {_tgt_name(tgt)} 在当前站超出连接器触及范围",
                               {"target_anchor": act.anchor or "",
                                "target_shuttle": act.shuttle or "",
-                               "reachable_targets": _fmt(prov.reach_set(i))}, h)
+                               "reachable_targets":
+                                   _fmt(prov.reach_set(i, h))}, h)
                     return res
                 other_t = hooks["B" if h == "A" else "A"]
                 blk = prov.attach_block(i, tgt, other_t)
@@ -462,7 +569,7 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                 old = hooks[h]
                 if old is not None:
                     other = "B" if h == "A" else "A"
-                    if hooks[other] is None or not prov.reachable(i, hooks[other]):
+                    if hooks[other] is None or not prov.reachable(i, hooks[other], other):
                         comp = {"from_anchor": _id_kind(old, "anchor"),
                                 "from_shuttle": _id_kind(old, "shuttle"),
                                 "target_anchor": act.anchor or "",
@@ -471,7 +578,8 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                                     _id_kind(hooks[other], "anchor"),
                                 "other_hook_shuttle":
                                     _id_kind(hooks[other], "shuttle"),
-                                "reachable_targets": _fmt(prov.reach_set(i))}
+                                "reachable_targets":
+                                    _fmt(prov.reach_set(i, h))}
                         if _has_flex(hooks) or old[0] == "shuttle" or tgt[0] == "shuttle":
                             res.open_items.append(OpenItem(
                                 station_index=i, position=pos(i),
@@ -489,7 +597,9 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                                      f"将失去全部有效连接", comp, h)
                         return res
                 hooks[h] = tgt
-                res.events.append(_ev(i, pos(i), person.id, act.action, h, old, tgt, hooks))
+                res.events.append(_ev(i, pos(i), person.id, act.action, h,
+                                      old, tgt, hooks,
+                                      leg_id[h] if leg_id else None))
             refresh()
 
         if i < n - 1 and not live(i):
@@ -524,6 +634,8 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
         if hooks[h] is not None:
             old = hooks[h]
             hooks[h] = None
-            res.events.append(_ev(n - 1, pos(n - 1), person.id, "detach", h, old, None, hooks))
+            res.events.append(_ev(n - 1, pos(n - 1), person.id, "detach", h,
+                                  old, None, hooks,
+                                  leg_id[h] if leg_id else None))
             refresh()
     return res

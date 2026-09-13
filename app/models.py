@@ -143,15 +143,70 @@ class ConservativeBounds(BaseModel):
     reason: str = ""
 
 
+class BufferCurvePoint(BaseModel):
+    """共享缓冲包力—行程曲线上的一点：展开 travel_m 时的展开阻力 force_kn。"""
+    travel_m: float = Field(ge=0)
+    force_kn: float = Field(ge=0)
+
+
+class LanyardLeg(BaseModel):
+    """Y 型（双腿共用缓冲包）系绳的一条实体腿：与指定钩永久绑定。"""
+    id: str = Field(description="实体腿 id（如 LA/LB），人工动作可据此核对钩腿绑定")
+    hook: Literal["A", "B"] = Field(description="该腿绑定的钩：自动/人工换挂均不得交叉")
+    leg_length_m: float = Field(gt=0, description="腿原长 L0（m）")
+    axial_stiffness_kn: float = Field(
+        gt=0, description="腿轴向刚度 k（kN/m）：T = k·弹性伸长")
+    connector_side_load_limit_kn: float = Field(
+        gt=0, description="腿端连接器容许侧载（kN，垂直绳腿主轴的分量）")
+
+
+class TwinLegLanyard(BaseModel):
+    """Y 型双腿系绳：两腿在汇接器汇合后共用**一个**缓冲包。
+
+    与旧等长模型互斥选用：Equipment.twin_leg 为 None 时完全沿用旧模型；
+    给出后按能量 + 变形协调求解载荷分配，同一缓冲能力只计一次。
+    """
+    legs: list[LanyardLeg] = Field(min_length=2, max_length=2)
+    buffer_curve: list[BufferCurvePoint] = Field(
+        min_length=2, description="缓冲力—行程曲线（行程严格递增，须覆盖最大行程）")
+    max_travel_m: float = Field(gt=0, description="缓冲包最大展开行程（m，完全展开）")
+    energy_capacity_j: float = Field(
+        gt=0, description="缓冲包能量容量（J）；曲线可吸收能量不得超过该值")
+    max_included_angle_deg: float = Field(
+        default=180.0, ge=0, le=180,
+        description="两腿在汇接器处的允许夹角（含，度）")
+
+    @model_validator(mode="after")
+    def _check_legs_curve(self) -> "TwinLegLanyard":
+        if len({l.id for l in self.legs}) != 2:
+            raise ValueError("双腿系绳的两腿 id 必须不同")
+        if {l.hook for l in self.legs} != {"A", "B"}:
+            raise ValueError("双腿系绳必须恰好一条腿绑 A 钩、一条腿绑 B 钩")
+        travels = [p.travel_m for p in self.buffer_curve]
+        if any(b <= a for a, b in zip(travels, travels[1:])):
+            raise ValueError("缓冲力—行程曲线的行程必须严格递增")
+        if travels[0] > 1e-9:
+            raise ValueError("缓冲力—行程曲线必须从行程 0 开始")
+        if travels[-1] < self.max_travel_m - 1e-9:
+            raise ValueError("缓冲力—行程曲线必须覆盖最大展开行程")
+        return self
+
+    def leg_for_hook(self, hook: str) -> LanyardLeg:
+        return next(l for l in self.legs if l.hook == hook)
+
+
 class Equipment(BaseModel):
-    """防坠装备：绳长、伸长量、缓冲行程、锐边等级、连接器触及范围。"""
+    """防坠装备：旧等长单连接模型；twin_leg 给出时改用 Y 型双腿载荷分配。"""
     id: str
     lanyard_length_m: float = Field(gt=0)
-    elongation_m: float = Field(ge=0, description="止坠时绳体伸长量")
-    buffer_travel_m: float = Field(ge=0, description="缓冲包展开行程")
+    elongation_m: float = Field(ge=0, description="止坠时绳体伸长量（旧模型）")
+    buffer_travel_m: float = Field(ge=0, description="缓冲包展开行程（旧模型）")
     sharp_edge_rating: int = Field(ge=0, le=3, description="可承受的锐边等级")
     connector_reach_m: float = Field(ge=0, description="连接器超出绳端的触及余量")
     max_arrest_force_kn: float = Field(default=6.0, gt=0)
+    twin_leg: Optional[TwinLegLanyard] = Field(
+        default=None,
+        description="Y 型双腿系绳参数；None 表示沿用旧等长单连接模型")
 
 
 class Person(BaseModel):
@@ -196,6 +251,9 @@ class ManualHookAction(BaseModel):
     shuttle: Optional[str] = Field(
         default=None, description="目标滑梭 id（attach/switch 与 anchor 二选一）")
     station_index: int = Field(ge=0, description="动作发生的站点序号")
+    leg: Optional[str] = Field(
+        default=None,
+        description="Y 型系绳实体腿 id：给出时必须与该钩绑定的腿一致（钩腿绑定）")
 
     @model_validator(mode="after")
     def _check_target(self) -> "ManualHookAction":
@@ -269,6 +327,11 @@ class PlanPayload(BaseModel):
         person_ids = {p.id for p in self.persons}
         anchor_id_set = set(anchor_ids)
         shuttle_id_set = set(shuttle_ids)
+        twin_person_legs: dict[str, dict[str, str]] = {}
+        for p in self.persons:
+            eq = next(e for e in self.equipment if e.id == p.equipment_id)
+            if eq.twin_leg is not None:
+                twin_person_legs[p.id] = {l.hook: l.id for l in eq.twin_leg.legs}
         for act in self.hook_order:
             if act.person_id not in person_ids:
                 raise ValueError(
@@ -279,6 +342,17 @@ class PlanPayload(BaseModel):
             if act.shuttle is not None and act.shuttle not in shuttle_id_set:
                 raise ValueError(
                     f"人工动作引用了不存在的滑梭 {act.shuttle}")
+            bound = twin_person_legs.get(act.person_id)
+            if bound is not None and act.leg is not None:
+                if act.leg != bound[act.hook]:
+                    raise ValueError(
+                        f"人员 {act.person_id} {act.hook} 钩绑定实体腿 "
+                        f"{bound[act.hook]}，人工动作不得换挂到腿 {act.leg}"
+                        f"（钩腿绑定不得交叉）")
+            if bound is None and act.leg is not None:
+                raise ValueError(
+                    f"人员 {act.person_id} 的装备非 Y 型双腿系绳，"
+                    f"人工动作不得指定实体腿 {act.leg}")
 
         if self.conservative_bounds.enabled and not self.conservative_bounds.reason.strip():
             raise ValueError("启用保守边界必须在 conservative_bounds.reason 中说明理由")
@@ -297,6 +371,8 @@ class SequenceEvent(BaseModel):
     person_id: str
     action: Literal["attach", "switch", "detach"]
     hook: Literal["A", "B"]
+    leg: Optional[str] = Field(
+        default=None, description="Y 型系绳该钩绑定的实体腿 id")
     from_anchor: Optional[str] = None
     to_anchor: Optional[str] = None
     from_shuttle: Optional[str] = None
@@ -356,6 +432,52 @@ class CableResult(BaseModel):
     converged: bool
 
 
+class LanyardLegResult(BaseModel):
+    """Y 型系绳单条实体腿在峰值制动力时刻的平衡分量。"""
+    leg_id: str
+    hook: Literal["A", "B"]
+    target_kind: Literal["anchor", "shuttle"]
+    target_id: str
+    anchor_position: Vec3 = Field(description="求解采用的挂点坐标（滑梭含动态下移）")
+    original_length_m: float
+    elastic_extension_m: float
+    tension_kn: float
+    vertical_component_kn: float
+    horizontal_component_kn: float
+    connector_side_load_kn: float = Field(
+        description="连接器侧载（垂直绳腿主轴的张力分量，kN）")
+    connector_side_load_limit_kn: float
+    taut: bool = Field(description="峰值时刻该腿是否承拉（松弛腿张力为 0）")
+
+
+class TwinLegResult(BaseModel):
+    """一站、一名双腿系绳佩戴者的载荷分配求解结果（能量 + 变形协调）。"""
+    station_index: int
+    position: Vec3
+    person_id: str
+    engagement_order: list[str] = Field(
+        description="接载次序：按各腿张紧时刻先后排列的实体腿 id")
+    legs: list[LanyardLegResult]
+    included_angle_deg: Optional[float] = Field(
+        default=None, description="两腿在汇接器处的夹角（度）；少于两条承拉腿为 None")
+    buffer_deployment_m: float = Field(description="共享缓冲包展开量（m）")
+    buffer_max_travel_m: float
+    buffer_force_kn: float = Field(description="展开量处的缓冲阻力（=人体峰值制动力，kN）")
+    energy_demand_j: float = Field(description="m·g·h 需吸收能量（J）")
+    buffer_energy_absorbed_j: float = Field(description="曲线积分的缓冲吸收能量（J）")
+    elastic_energy_j: float = Field(description="两腿弹性应变能之和（J）")
+    energy_capacity_j: float
+    free_fall_m: float
+    total_fall_m: float
+    required_clearance_m: float
+    available_clearance_m: Optional[float] = None
+    margin_m: Optional[float] = None
+    junction_position: Vec3 = Field(description="求解采用的汇接器位置")
+    converged: bool
+    adopted_params: dict[str, float | int | str | None] = Field(
+        default_factory=dict, description="采用参数（腿长、刚度、曲线行程/力、限值）")
+
+
 class ProfilePoint(BaseModel):
     """剖面标注：沿程每站的净空剖面数据。"""
     station_index: int
@@ -387,6 +509,7 @@ class AnalysisResult(BaseModel):
     sequence: list[SequenceEvent] = []
     profile: list[ProfilePoint] = []
     cable_results: list[CableResult] = []
+    twin_leg_results: list[TwinLegResult] = []
     conservative_used: list[str] = Field(
         default_factory=list, description="实际采用了保守边界的跨段 id")
     station_count: int = 0
@@ -395,8 +518,9 @@ class AnalysisResult(BaseModel):
 # ---------------------------------------------------------------- 方案与修订
 
 class ChangeRecord(BaseModel):
-    """修订变更说明：改跨、换滑梭或采用保守边界时必须给出理由。"""
-    kind: Literal["span_change", "shuttle_change", "conservative_bounds"]
+    """修订变更说明：改跨、换滑梭、换系绳或采用保守边界时必须给出理由。"""
+    kind: Literal["span_change", "shuttle_change", "lanyard_change",
+                  "conservative_bounds"]
     reason: str = Field(min_length=1)
     detail: str = ""
 

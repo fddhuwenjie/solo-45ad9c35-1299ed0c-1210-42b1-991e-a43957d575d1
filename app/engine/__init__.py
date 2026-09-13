@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from ..models import (AnalysisResult, CableResult, CheckFailure, OpenItem,
                       Person, PlanPayload, ProfilePoint, Vec3)
 from . import calc, cable, geometry as g
+from . import twinleg
 from .sequence import (ReachProvider, Target, build_sequence,
                        replay_sequence)
 from .shuttle_path import SpanPath, unloaded_bay_sags
@@ -86,14 +87,27 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
     missing_by_span = {sp.id: sp.missing_params() for sp in route.spans}
 
     # ---- 1. 可达性 / 共用容量 / 滑梭跨支座 -----------------------------
-    # 点锚：每目标每站独立可达；滑梭：站位有效且 D 环到该站滑梭位置可达
-    def shuttle_reachable(sid: str, i: int, person: Person, eq) -> bool:
+    # 点锚：每目标每站独立可达；滑梭：站位有效且 D 环到该站滑梭位置可达。
+    # Y 型双腿系绳：可达按该钩绑定实体腿的原长 + 装备连接器余量判定。
+    def anchor_reach(eq, hook: str | None) -> float:
+        if eq.twin_leg is not None and hook is not None:
+            return eq.twin_leg.leg_for_hook(hook).leg_length_m \
+                + eq.connector_reach_m
+        return eq.lanyard_length_m + eq.connector_reach_m
+
+    def shuttle_reach(eq, sid: str, hook: str | None) -> float:
+        if eq.twin_leg is not None and hook is not None:
+            return eq.twin_leg.leg_for_hook(hook).leg_length_m \
+                + eq.connector_reach_m
+        return eq.lanyard_length_m + shuttles[sid].connector_reach_m
+
+    def shuttle_reachable(sid: str, i: int, person: Person, eq,
+                          hook: str | None) -> bool:
         t = span_paths[shuttles[sid].span_id].table[i]
         if not t.valid:
             return False
         d = calc.d_ring_pos(stations[i], person)
-        reach = eq.lanyard_length_m + shuttles[sid].connector_reach_m
-        return g.dist3(d, t.point) <= reach + 1e-9
+        return g.dist3(d, t.point) <= shuttle_reach(eq, sid, hook) + 1e-9
 
     # 容量计数：点锚/滑梭按“占用钩数（人去重）”记录，用于他人容量上限；
     # 同一人 A/B 钩重复挂同一滑梭属 duplicate_occupancy（双钩不独立，不下结论）。
@@ -106,11 +120,47 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
         targets: list[Target] = [("anchor", a.id) for a in route.anchors] \
             + [("shuttle", s.id) for s in route.shuttles]
 
-        def reachable(i: int, t: Target) -> bool:
+        def reachable(i: int, t: Target, hook: str | None = None) -> bool:
             kind, tid = t
             if kind == "anchor":
-                return calc.reachable(stations[i], person, eq, anchors[tid])
-            return shuttle_reachable(tid, i, person, eq)
+                a = anchors[tid].position.as_tuple()
+                return g.dist3(calc.d_ring_pos(stations[i], person), a) \
+                    <= anchor_reach(eq, hook) + 1e-9
+            return shuttle_reachable(tid, i, person, eq, hook)
+
+        def leg_shortfall(i: int, t: Target, hook: str) -> dict | None:
+            """Y 型双腿系绳：该钩绑定腿的触及包络（含装备连接器余量）是否
+            恰好差在腿长上——目标在另一钩（更长）腿的包络内或本可换挂，
+            仅因绑定腿过短而不可达时，返回超差分量；其他原因返回 None。"""
+            if eq.twin_leg is None:
+                return None
+            leg = eq.twin_leg.leg_for_hook(hook)
+            reach = leg.leg_length_m + eq.connector_reach_m
+            kind, tid = t
+            if kind == "anchor":
+                tp = anchors[tid].position.as_tuple()
+            else:
+                te = span_paths[shuttles[tid].span_id].table[i]
+                if not te.valid:
+                    return None
+                tp = te.point
+            d_ring = calc.d_ring_pos(stations[i], person)
+            d = g.dist3(d_ring, tp)
+            if d <= reach + 1e-9:
+                return None                      # 本腿可达，非腿长问题
+            # 目标在另一钩腿的包络内：可证明确系该绑定腿长度不足
+            other = "B" if hook == "A" else "A"
+            other_len = eq.twin_leg.leg_for_hook(other).leg_length_m
+            other_reach = other_len + eq.connector_reach_m
+            if d > other_reach + 1e-9:
+                return None                      # 两腿都够不着，不属本判定
+            return {"target": f"{'滑梭' if kind == 'shuttle' else '锚点'} {tid}",
+                    "target_kind": kind, "target_id": tid,
+                    "bound_leg": leg.id, "hook": hook,
+                    "leg_length_m": leg.leg_length_m,
+                    "connector_reach_m": eq.connector_reach_m,
+                    "required_m": round(d, 4),
+                    "shortfall_m": round(d - reach, 4)}
 
         # 前向连续可达末站
         last_cache: dict[Target, list[int]] = {}
@@ -194,7 +244,8 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
             anchor_max_users=lambda aid: anchors[aid].max_users,
             shuttle_span=lambda sid: shuttles[sid].span_id,
             span_supports=lambda spid: spans[spid].supports,
-            crosses_blocked=crosses_blocked)
+            crosses_blocked=crosses_blocked,
+            leg_length_shortfall=leg_shortfall)
 
     # ---- 2. 挂接序列（人工次序回放 / 自动生成） -------------------------
     manual: dict[str, list] = {}
