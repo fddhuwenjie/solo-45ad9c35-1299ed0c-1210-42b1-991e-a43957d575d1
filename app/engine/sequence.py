@@ -164,7 +164,9 @@ def replay_sequence(person: Person, eq: Equipment,
 
     校验规则：进站时已挂接的钩至少一个在当前站有效；detach 后另一钩必须
     仍保持有效连接；attach/switch 的目标锚点必须在连接器触及范围内且不超
-    多人共用限制；每站处理完动作后（末站除外）至少保留一个有效连接。
+    多人共用限制，且若该钩原本挂有锚点（旧连接将被释放），另一钩必须在
+    当前站保持有效连接——覆盖旧连接断开至新连接建立的全过程；
+    每站处理完动作后（末站除外）至少保留一个有效连接。
     末站仍挂接的钩由引擎补记解钩事件（离开路线）。
     """
     n = len(stations)
@@ -244,6 +246,21 @@ def replay_sequence(person: Person, eq: Equipment,
                           "max_users": anchors[aid].max_users})
                     return res
                 old = hooks[h]
+                if old is not None:
+                    # 该钩原本挂有锚点：旧连接断开至新连接建立期间，
+                    # 另一钩必须保持有效连接
+                    other = "B" if h == "A" else "A"
+                    if hooks[other] is None or hooks[other] not in reach[i]:
+                        fail(i, act.action,
+                             f"换挂 {h} 钩期间另一钩无有效连接：旧连接 "
+                             f"{old} 断开至新连接 {aid} 建立前"
+                             f"将失去全部有效连接",
+                             {"failing_hook": h, "from_anchor": old,
+                              "target_anchor": aid or "",
+                              "other_hook_anchor": hooks[other] or "",
+                              "reachable_anchors":
+                                  ",".join(sorted(reach[i]))})
+                        return res
                 hooks[h] = aid
                 event(i, act.action, h, old, aid)
             refresh_attached()

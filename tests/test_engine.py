@@ -264,6 +264,59 @@ def test_manual_order_gap_breaks_chain():
     assert ff.station_index == 3
 
 
+def test_manual_switch_with_empty_other_hook_rejected():
+    """B 钩始终为空、A 钩连续 switch：换挂期间失去全部有效连接。"""
+    p = passable_payload()
+    p["hook_order"] = [
+        {"person_id": "p1", "hook": "A", "action": "attach",
+         "anchor": "A0", "station_index": 0},
+    ] + [
+        {"person_id": "p1", "hook": "A", "action": "switch",
+         "anchor": f"A{k}", "station_index": 3 * k - 2}
+        for k in range(1, 8)
+    ]
+    r = run(p)
+    assert not r.passable
+    ff = r.first_failure
+    assert ff.check == "hook_chain" and ff.action == "switch"
+    # 首次换挂（站点 1，A0 -> A1）即失败
+    assert ff.station_index == 1
+    c = ff.components
+    assert c["failing_hook"] == "A"
+    assert c["from_anchor"] == "A0" and c["target_anchor"] == "A1"
+    assert c["other_hook_anchor"] == ""
+
+
+def test_manual_switch_other_hook_out_of_reach_rejected():
+    """换挂时另一钩虽挂接但已出触及范围，同样判定断链。"""
+    p = passable_payload()
+    p["hook_order"] = [
+        {"person_id": "p1", "hook": "A", "action": "attach",
+         "anchor": "A0", "station_index": 0},
+        {"person_id": "p1", "hook": "B", "action": "attach",
+         "anchor": "A0", "station_index": 0},
+        {"person_id": "p1", "hook": "A", "action": "switch",
+         "anchor": "A1", "station_index": 2},
+        # 站点 4：B 钩仍挂在 A0（x=0，距站点 x=2.0 已超触及范围），
+        # A 钩换挂 A1 -> A2 期间无有效连接
+        {"person_id": "p1", "hook": "A", "action": "switch",
+         "anchor": "A2", "station_index": 4},
+    ]
+    r = run(p)
+    assert not r.passable
+    ff = r.first_failure
+    assert ff.check == "hook_chain" and ff.action == "switch"
+    assert ff.station_index == 4
+    assert ff.components["from_anchor"] == "A1"
+    assert ff.components["target_anchor"] == "A2"
+    assert ff.components["other_hook_anchor"] == "A0"
+
+
+def test_manual_switch_with_backup_hook_passes():
+    """另一钩在当前站保持有效连接时，连续换挂可通行（回归保护）。"""
+    assert run(manual_order_payload()).passable
+
+
 # ---------------------------------------------------------------- 确定性
 
 def test_analysis_deterministic():
