@@ -16,7 +16,9 @@ from app.engine import analyze, twinleg
 from app.models import BufferCurvePoint, PlanPayload
 
 from .scenarios import (passable_payload, twin_angle_payload,
-                        twin_energy_payload, twin_manual_payload,
+                        twin_buffer_capacity_payload, twin_energy_payload,
+                        twin_manual_payload,
+                        twin_mixed_anchor_shuttle_payload,
                         twin_passable_payload, twin_side_load_payload,
                         twin_unequal_legs_payload)
 
@@ -212,6 +214,63 @@ def test_manual_cross_binding_rejected_at_validation():
     p["hook_order"][0]["leg"] = "LB"   # A 钩不得绑到 LB 腿
     with pytest.raises(pydantic.ValidationError):
         PlanPayload.model_validate(p)
+
+
+# ---------------------------------------------------------------- 误判回归
+
+def test_mixed_anchor_shuttle_anchor_load_counted_once():
+    """固定锚腿 + 滑梭腿混挂：静态、动态两阶段不得重复登记固定锚负荷。
+
+    钢索下挠后滑梭腿在峰值时刻松弛、固定锚腿独承 3.0 kN；4.5 kN 额定
+    锚点若被静态+动态虚增为 6.0 kN 会误判 anchor_overload。
+    """
+    r = run(twin_mixed_anchor_shuttle_payload(rated_anchor=4.5))
+    assert r.conclusive, [o.code for o in r.open_items]
+    assert not any(f.check == "anchor_overload" for f in r.failures)
+    # 存在“滑梭腿松弛、固定锚腿独承”的站，且该锚腿张力恰为 3.0 kN（只计一次）
+    solo = [t for t in r.twin_leg_results
+            if any(not l.taut for l in t.legs)
+            and any(l.target_id.startswith("AX") and l.taut for l in t.legs)]
+    assert solo, "应存在固定锚腿独承、滑梭腿松弛的站"
+    for t in solo:
+        fixed = [l for l in t.legs
+                 if l.target_id.startswith("AX") and l.taut]
+        assert len(fixed) == 1
+        assert abs(fixed[0].tension_kn - 3.0) < 1e-6
+
+
+def test_mixed_anchor_shuttle_still_overloads_when_truly_exceeded():
+    """对照组：额定 2.0 kN（低于真实 3.0 kN 单腿张力）仍应判过载，
+    证明不是简单地屏蔽了 anchor_overload。"""
+    r = run(twin_mixed_anchor_shuttle_payload(rated_anchor=2.0))
+    assert any(f.check == "anchor_overload" for f in r.failures)
+
+
+def test_buffer_capacity_compares_only_curve_absorbed_energy():
+    """容量只与共享缓冲曲线实际吸收能量比较；腿部弹性能不得并入。
+
+    曲线吸收 ≈4635 J（< 5000 J），叠加腿部弹性 ≈2083 J 后合计 ≈6718 J，
+    不得据此返回 buffer_energy。
+    """
+    r = run(twin_buffer_capacity_payload())
+    t = r.twin_leg_results[0]
+    # 数值关系：曲线吸收 < 容量 < 曲线+弹性合计
+    assert t.buffer_energy_absorbed_j < t.energy_capacity_j
+    assert (t.buffer_energy_absorbed_j + t.elastic_energy_j) \
+        > t.energy_capacity_j
+    assert t.elastic_energy_j > 1000.0
+    assert not any(f.check == "buffer_energy" for f in r.failures)
+    assert r.conclusive and r.passable, \
+        [(f.check, f.message[:40]) for f in r.failures]
+
+
+def test_buffer_capacity_still_blocks_when_curve_energy_exceeds():
+    """对照组：曲线自身吸收超过容量时仍应判 buffer_energy。"""
+    p = twin_buffer_capacity_payload()
+    p["equipment"][0]["twin_leg"]["energy_capacity_j"] = 4000.0
+    r = run(p)
+    assert any(f.check == "buffer_energy" for f in r.failures)
+    assert not r.passable
 
 
 # ---------------------------------------------------------------- 旧模型兼容

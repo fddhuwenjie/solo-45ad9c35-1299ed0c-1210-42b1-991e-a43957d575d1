@@ -14,7 +14,9 @@ from app.db import Store
 from app.main import app, get_store
 
 from .scenarios import (flex_passable_payload, passable_payload,
-                        twin_angle_payload, twin_flex_payload,
+                        twin_angle_payload, twin_buffer_capacity_payload,
+                        twin_flex_payload,
+                        twin_mixed_anchor_shuttle_payload,
                         twin_passable_payload)
 
 
@@ -143,6 +145,42 @@ def test_confirmed_twin_revision_read_only(client):
     r = client.put(f"/plans/{plan_id}/revisions/1",
                    json={"note": "x", "payload": changed})
     assert r.status_code == 409
+
+
+# ---------------------------------------------------------------- 误判回归
+
+def test_mixed_anchor_shuttle_anchor_load_once_over_http(client):
+    """HTTP/SQLite 路径：固定锚腿独承 3.0 kN 时 4.5 kN 锚点不误判过载。"""
+    r = _create(client, twin_mixed_anchor_shuttle_payload(4.5),
+                name="混挂防重复计数")
+    assert r.status_code == 201, r.text
+    a = r.json()["analysis"]
+    assert a["conclusive"] and a["passable"], \
+        [(f["check"], f["station_index"]) for f in a["failures"]]
+    assert not any(f["check"] == "anchor_overload" for f in a["failures"])
+    # 存在固定锚腿独承 3.0 kN、滑梭腿松弛的站
+    solo = [t for t in a["twin_leg_results"]
+            if any(not l["taut"] for l in t["legs"])
+            and any(l["target_id"].startswith("AX") and l["taut"]
+                    for l in t["legs"])]
+    assert solo
+    fixed = [l for l in solo[0]["legs"]
+             if l["target_id"].startswith("AX") and l["taut"]]
+    assert abs(fixed[0]["tension_kn"] - 3.0) < 1e-6
+
+
+def test_buffer_capacity_compares_only_curve_energy_over_http(client):
+    """HTTP 路径：曲线吸收 < 容量 < 曲线+腿部弹性能时不误判 buffer_energy。"""
+    r = _create(client, twin_buffer_capacity_payload(),
+                name="缓冲容量只比曲线")
+    assert r.status_code == 201, r.text
+    a = r.json()["analysis"]
+    t = a["twin_leg_results"][0]
+    assert t["buffer_energy_absorbed_j"] < t["energy_capacity_j"]
+    assert (t["buffer_energy_absorbed_j"] + t["elastic_energy_j"]) \
+        > t["energy_capacity_j"]
+    assert not any(f["check"] == "buffer_energy" for f in a["failures"])
+    assert a["conclusive"] and a["passable"]
 
 
 # ---------------------------------------------------------------- 兼容 / SQLite

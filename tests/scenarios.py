@@ -473,6 +473,118 @@ def twin_flex_payload():
     }
 
 
+def _mixed_anchor_shuttle_equipment(rated_anchor=4.5):
+    """固定锚 AX + 滑梭 T1 混挂：固定锚额定 rated_anchor kN（介于
+    单腿 3.0 与虚增 6.0 之间），曲线恒力 3 kN。"""
+    return {
+        "id": "eqt", "lanyard_length_m": 1.6, "elongation_m": 0.2,
+        "buffer_travel_m": 1.0, "sharp_edge_rating": 1,
+        "connector_reach_m": 0.3, "max_arrest_force_kn": 6.0,
+        "twin_leg": {
+            "legs": [
+                {"id": "LA", "hook": "A", "leg_length_m": 1.6,
+                 "axial_stiffness_kn": 20000.0,
+                 "connector_side_load_limit_kn": 16.0},
+                {"id": "LB", "hook": "B", "leg_length_m": 1.6,
+                 "axial_stiffness_kn": 20000.0,
+                 "connector_side_load_limit_kn": 16.0},
+            ],
+            "buffer_curve": [
+                {"travel_m": 0.0, "force_kn": 3.0},
+                {"travel_m": 1.2, "force_kn": 3.0},
+            ],
+            "max_travel_m": 1.2, "energy_capacity_j": 5000.0,
+            "max_included_angle_deg": 120.0,
+        }}
+
+
+def twin_mixed_anchor_shuttle_payload(rated_anchor=4.5):
+    """固定锚腿 + 滑梭腿混挂（弱跨段低预张力/低 EA，单人加载下钢索下挠
+    约 0.25 m）：下挠后滑梭腿在峰值时刻松弛，固定锚腿独承 3.0 kN。
+
+    固定锚额定 4.5 kN（介于真实 3.0 与静态+动态虚增的 6.0 之间）：若同一
+    固定锚腿负荷在静态、动态两阶段被重复登记，会误判 anchor_overload。
+    """
+    supports = [
+        {"id": "S0", "position": v(0, 0, 2.6), "rated_load_kn": 50.0},
+        {"id": "S1", "position": v(10, 0, 2.6), "rated_load_kn": 50.0},
+    ]
+    route = flex_span_route(
+        supports=supports, span_kw={
+            "pretension_kn": 1.0, "axial_stiffness_kn": 800.0,
+            "max_sag_m": 3.0},
+        anchors=[
+            {"id": "AX", "position": v(0, 0, 2.6),
+             "rated_load_kn": rated_anchor, "max_users": 2},
+            {"id": "AX2", "position": v(1, 0, 2.6),
+             "rated_load_kn": rated_anchor, "max_users": 2},
+        ],
+        shuttles=[
+            {"id": "T1", "span_id": "H1", "connector_reach_m": 0.3,
+             "max_users": 1, "can_pass": True},
+            {"id": "T2", "span_id": "H1", "connector_reach_m": 0.3,
+             "max_users": 1, "can_pass": True},
+        ])
+    p = {
+        "route": route,
+        "persons": [base_person(equipment_id="eqt", d_ring_height_m=1.4)],
+        "equipment": [_mixed_anchor_shuttle_equipment(rated_anchor)],
+        "params": {"station_spacing_m": 0.5},
+        # 人工：A 钩(LA) 挂固定锚 AX，B 钩(LB) 挂滑梭 T1
+        "hook_order": [
+            {"person_id": "p1", "hook": "A", "action": "attach",
+             "anchor": "AX", "station_index": 0, "leg": "LA"},
+            {"person_id": "p1", "hook": "B", "action": "attach",
+             "shuttle": "T1", "station_index": 0, "leg": "LB"},
+        ],
+    }
+    # 行走线限制在 0~0.5 m：固定锚 AX 与滑梭 T1 在两站均可达，
+    # 不需换钩即可出现下挠后滑梭腿松弛、固定锚腿独承的站
+    p["route"]["walk_polyline"] = [v(0, 0, 0), v(0.5, 0, 0)]
+    return p
+
+
+def twin_buffer_capacity_payload():
+    """缓冲曲线实际吸收 ≈4635 J（< 5000 J 容量），但腿部弹性能 ≈2083 J，
+    二者合计 ≈6718 J。容量只应与曲线吸收比较，不得合计后误判 buffer_energy。
+    """
+    return {
+        "route": {
+            "walk_polyline": [v(0, 0, 0), v(0.5, 0, 0)],
+            "drop_edges": [], "obstacles": [],
+            "anchors": [
+                {"id": "A1", "position": v(-0.01, 0, -2.0),
+                 "rated_load_kn": 50.0, "max_users": 2},
+                {"id": "A2", "position": v(0.01, 0, -2.0),
+                 "rated_load_kn": 50.0, "max_users": 2},
+            ],
+            "supports": [], "spans": [], "shuttles": [],
+        },
+        "persons": [base_person(equipment_id="eqt", d_ring_height_m=1.4)],
+        "equipment": [{
+            "id": "eqt", "lanyard_length_m": 3.4, "elongation_m": 0.2,
+            "buffer_travel_m": 1.0, "sharp_edge_rating": 3,
+            "connector_reach_m": 0.3, "max_arrest_force_kn": 8.0,
+            "twin_leg": {
+                "legs": [
+                    {"id": "LA", "hook": "A", "leg_length_m": 3.4,
+                     "axial_stiffness_kn": 3.0,
+                     "connector_side_load_limit_kn": 16.0},
+                    {"id": "LB", "hook": "B", "leg_length_m": 3.4,
+                     "axial_stiffness_kn": 3.0,
+                     "connector_side_load_limit_kn": 16.0},
+                ],
+                "buffer_curve": [
+                    {"travel_m": 0.0, "force_kn": 5.0},
+                    {"travel_m": 2.0, "force_kn": 5.0},
+                ],
+                "max_travel_m": 2.0, "energy_capacity_j": 5000.0,
+                "max_included_angle_deg": 180.0,
+            }}],
+        "params": {"station_spacing_m": 0.5},
+    }
+
+
 # ---------------------------------------------------------------- 救援推演
 
 def rescue_payload(*, entry=None, anchors=None, rope_main_len=60.0,

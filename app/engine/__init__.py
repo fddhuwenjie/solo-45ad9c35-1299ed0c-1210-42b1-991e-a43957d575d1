@@ -305,6 +305,9 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
     point_load: list[dict[str, float]] = [dict() for _ in range(n)]
     point_users: list[dict[str, list[str]]] = [dict() for _ in range(n)]
     twin_results: list = []
+    # 双腿评估已登记的锚点负荷/占用/FallCalc 台账：动态重算前据此回滚，
+    # 避免同一固定锚腿在静态、动态两个阶段被重复计数。
+    twin_load_ledger: dict[tuple[int, str], dict[str, float]] = {}
     # (i, pid) -> TwinSolution：第 5 节悬索迭代复用/精化，剖面与救援复用
     twin_solutions: dict[tuple[int, str], object] = {}
     # 双腿系绳佩戴者在站 i 的钩→(kind,id) 映射（用于跨段迭代与结果构建）
@@ -353,6 +356,10 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
                                     "hook_B": _tid_target(by_hook.get("B"))}))
                     continue
                 twin_hooks[(i, person.id)] = by_hook
+                # 含滑梭腿的站交给第 5b 节按动态下挠求解；此处若先用静态
+                # 挂点评估，残留的静态 failure/锚负荷会与动态结果重复计数。
+                if span_of:
+                    continue
                 sol, by_hook = eval_twin_station(person, eq, state, i, {})
                 twin_solutions[(i, person.id)] = sol
                 _evaluate_twin_solution(
@@ -360,7 +367,8 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
                     shuttles, span_paths, route, params, failures,
                     open_items, point_load, point_users,
                     twin_results, twin_solutions, dynamic=False,
-                    point_falls=point_falls)
+                    point_falls=point_falls,
+                    twin_load_ledger=twin_load_ledger)
                 continue
 
             anchor_targets = sorted({t for t in state
@@ -591,10 +599,12 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
 
             # 初解（静态挂点）
             sol = run_twin({})
-            force0 = sol.buffer_force_kn if sol.converged \
-                else eq.max_arrest_force_kn
+            f_cap = eq.max_arrest_force_kn
+            force0 = min(sol.buffer_force_kn, f_cap) if sol.converged \
+                else f_cap
             bay_sol = None
             sag_prev = 0.0
+            diverged = False
             for _it in range(25):
                 load = cable.BayLoad(pid, te.frac, force0)
                 bay_sol = cable.solve_bay(
@@ -606,20 +616,33 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
                 if not bay_sol.converged:
                     break
                 sag_k = bay_sol.load_sags_m[0]
+                # 下挠正反馈保护：下挠/力异常放大即判定发散
+                if not (math.isfinite(sag_k) and math.isfinite(force0)) \
+                        or sag_k > bay.horiz + 5.0 \
+                        or force0 > f_cap * 5.0 + 1.0:
+                    diverged = True
+                    break
                 sag_by_sid = {t[1]: sag_k for t in shuttle_hooks.values()}
                 sol = run_twin(sag_by_sid)
-                f_new = sol.buffer_force_kn if sol.converged else force0
+                if not sol.converged:
+                    diverged = True
+                    break
+                # 力封顶于装备最大止坠力，并欠松弛抑制下挠正反馈
+                f_target = min(sol.buffer_force_kn, f_cap)
+                f_new = 0.5 * force0 + 0.5 * f_target
                 if abs(f_new - force0) < 1e-4 and abs(sag_k - sag_prev) < 1e-6:
                     force0 = f_new
                     sag_prev = sag_k
                     break
                 force0, sag_prev = f_new, sag_k
 
+            if diverged:
+                bay_sol = None
             final_sags = {t[1]: sag_prev for t in shuttle_hooks.values()}
             sol = run_twin(final_sags)
 
             # 悬索不收敛：不下结论
-            if bay_sol is None or not bay_sol.converged:
+            if diverged or bay_sol is None or not bay_sol.converged:
                 open_items.append(OpenItem(
                     station_index=i, position=pos(i), person_id=pid,
                     action="traverse", code="solver_nonconvergence",
@@ -638,6 +661,7 @@ def build_context(payload: PlanPayload) -> AnalysisContext:
                 shuttles, span_paths, route, params, failures, open_items,
                 point_load, point_users, twin_results, twin_solutions,
                 dynamic=True, point_falls=point_falls,
+                twin_load_ledger=twin_load_ledger,
                 seq_events_by_station=seq_events_by_station)
 
             # 挠度限值 + 端座/支座反力（单人组合即结构包络）
@@ -939,12 +963,28 @@ def _evaluate_twin_solution(i, person, eq, sol, by_hook, stations, pos,
                             failures, open_items, point_load, point_users,
                             twin_results, twin_solutions, *, dynamic,
                             point_falls=None,
+                            twin_load_ledger=None,
                             seq_events_by_station=None):
     """把一个双腿物理解登记为结果并执行全部判定。
 
     dynamic=True 表示挂点已含悬索动态下挠（由第 5 节回写）；此时替换既有
-    静态结果，避免同一缓冲能力被重复计入。
+    静态结果，并经台账回滚静态阶段已登记的固定锚负荷/占用/FallCalc，避免
+    同一固定锚腿在两个阶段被重复计入。
     """
+    key = (i, person.id)
+    if dynamic and twin_load_ledger is not None and key in twin_load_ledger:
+        prev = twin_load_ledger.pop(key)
+        for aid, load in prev["loads"].items():
+            point_load[i][aid] = point_load[i].get(aid, 0.0) - load
+            users = point_users[i].get(aid)
+            if users and person.id in users:
+                users.remove(person.id)
+                if not users:
+                    point_users[i].pop(aid, None)
+        if point_falls is not None:
+            for aid in prev["fall_anchors"]:
+                point_falls.pop((i, aid), None)
+
     res = _build_twin_result(i, pos(i), person, eq, sol, by_hook, anchors,
                              shuttles, span_paths, stations, params, route)
     if dynamic:
@@ -1002,10 +1042,15 @@ def _evaluate_twin_solution(i, person, eq, sol, by_hook, stations, pos,
              f"能量亏缺，曲线能量不足，不得标为可通行",
              {"energy_shortfall_j":
                  round(max(0.0, sol.demand_at_full_j - sol.buffer_energy_j), 2)})
-    elif res.energy_demand_j > eq.twin_leg.energy_capacity_j + 1e-6:
+    elif res.buffer_energy_absorbed_j > eq.twin_leg.energy_capacity_j + 1e-6:
+        # 容量只约束共享缓冲曲线实际吸收的能量；腿部弹性应变能由绳腿承担，
+        # 不并入缓冲包容量，也不随两腿重复计入。
         fail("buffer_energy",
-             f"坠落需吸收能量 {round(res.energy_demand_j, 1)} J 超过缓冲包"
-             f"能量容量 {eq.twin_leg.energy_capacity_j} J", {})
+             f"共享缓冲曲线实际吸收能量 "
+             f"{round(res.buffer_energy_absorbed_j, 1)} J 超过缓冲包能量容量 "
+             f"{eq.twin_leg.energy_capacity_j} J",
+             {"buffer_energy_absorbed_j": res.buffer_energy_absorbed_j,
+              "elastic_energy_j": res.elastic_energy_j})
 
     # ---- 人体峰值制动力超限 --------------------------------------------
     if res.buffer_force_kn > eq.max_arrest_force_kn + 1e-9:
@@ -1082,11 +1127,13 @@ def _evaluate_twin_solution(i, person, eq, sol, by_hook, stations, pos,
                   "equipment_sharp_edge_rating": eq.sharp_edge_rating})
 
     # ---- 登记锚点负荷（合力 = 该锚所连各承拉腿张力之和） ----------------
+    fall_anchors: list[str] = []
     for aid, load in anchor_load_add.items():
         point_load[i][aid] = point_load[i].get(aid, 0.0) + load
         point_users[i].setdefault(aid, [])
         if person.id not in point_users[i][aid]:
             point_users[i][aid].append(person.id)
+        fall_anchors.append(aid)
 
     # ---- 为承拉点锚腿合成 FallCalc，供坠落后救援推演复用冻结分量 ---------
     if point_falls is not None:
@@ -1112,6 +1159,12 @@ def _evaluate_twin_solution(i, person, eq, sol, by_hook, stations, pos,
                 swing_radius_m=round(
                     lg.original_length_m + lg.elastic_extension_m
                     + res.buffer_deployment_m, 4))
+            if lg.target_id not in fall_anchors:
+                fall_anchors.append(lg.target_id)
+
+    if twin_load_ledger is not None:
+        twin_load_ledger[key] = {"loads": dict(anchor_load_add),
+                                 "fall_anchors": fall_anchors}
     return res
 
 

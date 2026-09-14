@@ -508,6 +508,38 @@ def replay_sequence(person: Person, eq: Equipment, prov: ReachProvider,
                           "行进至当前站时已无有效连接（换挂链断开）", comp)
             return res
 
+        # 逐钩校验（仅 Y 型双腿系绳）：人工次序可能只在某些站给出动作，
+        # 已建立的连接随行进超出该钩绑定实体腿触及范围且未在本站换挂时，
+        # 该钩不得继续以失效几何参与载荷分配（否则会解出非物理的超大张力）。
+        # 旧等长模型保持“在换挂动作时才判定备份钩”的原语义。
+        if twin is not None:
+            for h in ("A", "B"):
+                cur = hooks[h]
+                if cur is not None and not prov.reachable(i, cur, h):
+                    sf = prov.leg_length_shortfall(i, cur, h)
+                    if sf is not None:
+                        leg_short_fail(i, "traverse", h, sf)
+                        return res
+                    comp = {"hook_A": _tid(hooks["A"]),
+                            "hook_B": _tid(hooks["B"]),
+                            "failing_hook": h,
+                            "current_target": _tid(cur)}
+                    if cur[0] == "shuttle" or _has_flex(hooks):
+                        res.open_items.append(OpenItem(
+                            station_index=i, position=pos(i),
+                            person_id=person.id, action="traverse",
+                            code="continuity_break",
+                            message=f"{h} 钩连接 {_tgt_name(cur)} 已超出触及"
+                                    f"范围且未换挂，柔性体系连续性断开",
+                            components=comp))
+                        res.states.extend([None] * (n - len(res.states)))
+                    else:
+                        hook_fail(i, "traverse",
+                                  f"{h} 钩连接 {cur[1]} 已超出其绑定实体腿"
+                                  f" {leg_id[h]} 的触及范围且未换挂，"
+                                  f"该连接无法继续承载", comp, h)
+                    return res
+
         for act in by_station.get(i, []):
             h = act.hook
             if twin is not None and act.leg is not None \
