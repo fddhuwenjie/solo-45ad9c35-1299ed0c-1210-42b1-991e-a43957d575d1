@@ -34,7 +34,7 @@ class ReachProvider:
 
     def __init__(self, n: int, stations: list[Vec],
                  reachable: Callable[[int, Target, Optional[str]], bool],
-                 last_reach: Callable[[Target, int], int],
+                 last_reach: Callable[[Target, int, Optional[str]], int],
                  attach_block: Callable[[int, Target, Optional[Target]],
                                         Optional[tuple[str, dict]]],
                  occupy: Callable[[int, Target], None],
@@ -75,8 +75,9 @@ class ReachProvider:
     def reach_set(self, i: int, hook: Optional[str] = None) -> set[Target]:
         return {t for t in self.targets if self.reachable(i, t, hook)}
 
-    def last_reach(self, t: Target, i: int) -> int:
-        return self.last_reach_fn(t, i)
+    def last_reach(self, t: Target, i: int,
+                   hook: Optional[str] = None) -> int:
+        return self.last_reach_fn(t, i, hook)
 
     def candidates(self, i: int, *, require_forward: bool = False,
                    other: Target | None = None,
@@ -88,13 +89,13 @@ class ReachProvider:
         for t in self.reach_set(i, hook):
             if self.attach_block(i, t, other) is not None:
                 continue
-            if require_forward and self.last_reach(t, i) <= i:
+            if require_forward and self.last_reach(t, i, hook) <= i:
                 continue
             kind, tid = t
             d = g.dist3(self.stations[i], self.target_pos(i, t))
             # 同前向覆盖、同距离时点锚优先（0 < 1）
             out.append((0 if kind == "anchor" else 1,
-                        -self.last_reach(t, i), d, t))
+                        -self.last_reach(t, i, hook), d, t))
         out.sort()
         return [t for *_x, t in out]
 
@@ -115,7 +116,7 @@ class ReachProvider:
         """前向（下一站仍可达）目标中的占用阻塞，用于无候选时分类上报。"""
         best = None
         for t in sorted(self.reach_set(i, hook)):
-            if self.last_reach(t, i) <= i:
+            if self.last_reach(t, i, hook) <= i:
                 continue
             blk = self.attach_block(i, t, other)
             if blk is not None and (best is None or blk[0] < best[1]):

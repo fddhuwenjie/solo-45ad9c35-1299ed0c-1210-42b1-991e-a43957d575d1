@@ -775,9 +775,19 @@ def source_relevance_signature(payload: PlanPayload,
                 p.body_radius_m)
                for p in payload.persons if p.id in pids]
     eq_ids = {p.equipment_id for p in payload.persons if p.id in pids}
-    equip = [(e.id, e.lanyard_length_m, e.elongation_m, e.buffer_travel_m,
-              e.max_arrest_force_kn)
-             for e in payload.equipment if e.id in eq_ids]
+    def _eq_sig(e):
+        if e.twin_leg is None:
+            return (e.id, e.lanyard_length_m, e.elongation_m,
+                    e.buffer_travel_m, e.max_arrest_force_kn, None)
+        t = e.twin_leg
+        return (e.id, e.lanyard_length_m, e.elongation_m,
+                e.buffer_travel_m, e.max_arrest_force_kn,
+                (tuple((l.id, l.hook, l.leg_length_m, l.axial_stiffness_kn,
+                        l.connector_side_load_limit_kn) for l in t.legs),
+                 tuple((p.travel_m, p.force_kn) for p in t.buffer_curve),
+                 t.max_travel_m, t.energy_capacity_j,
+                 t.max_included_angle_deg))
+    equip = [_eq_sig(e) for e in payload.equipment if e.id in eq_ids]
     anchors = [(a.id, a.position.model_dump(), a.rated_load_kn)
                for a in payload.route.anchors if a.id in aids]
     shuttles = [(s.id, s.span_id, s.connector_reach_m, s.can_pass)

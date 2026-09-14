@@ -313,6 +313,166 @@ def mixed_anchor_span_payload():
     return p
 
 
+# ---------------------------------------------------------------- Y 型双腿系绳
+
+def twin_equipment(**kw):
+    """默认 Y 型双腿系绳装备：两腿 2.5 m 等长、刚度 2000 kN/m、恒力 3 kN
+    缓冲曲线（行程 1.2 m）、能量容量 5000 J、允许夹角 120°。"""
+    eq = {
+        "id": "eqt",
+        "lanyard_length_m": 2.5,
+        "elongation_m": 0.2,
+        "buffer_travel_m": 1.0,
+        "sharp_edge_rating": 1,
+        "connector_reach_m": 0.3,
+        "max_arrest_force_kn": 6.0,
+        "twin_leg": {
+            "legs": [
+                {"id": "LA", "hook": "A", "leg_length_m": 2.5,
+                 "axial_stiffness_kn": 2000.0,
+                 "connector_side_load_limit_kn": 16.0},
+                {"id": "LB", "hook": "B", "leg_length_m": 2.5,
+                 "axial_stiffness_kn": 2000.0,
+                 "connector_side_load_limit_kn": 16.0},
+            ],
+            "buffer_curve": [
+                {"travel_m": 0.0, "force_kn": 3.0},
+                {"travel_m": 1.2, "force_kn": 3.0},
+            ],
+            "max_travel_m": 1.2,
+            "energy_capacity_j": 5000.0,
+            "max_included_angle_deg": 120.0,
+        },
+    }
+    eq.update(kw)
+    return eq
+
+
+def twin_side_anchors(xs=(0.0, 0.5, 1.0), y=1.5, z=3.4, rated=12.0):
+    """左右两列（y=±）头顶锚点，便于两腿分挂产生夹角。"""
+    anchors = [
+        {"id": f"a{k}", "position": v(x, -y, z),
+         "rated_load_kn": rated, "max_users": 2}
+        for k, x in enumerate(xs)]
+    anchors += [
+        {"id": f"b{k}", "position": v(x, y, z),
+         "rated_load_kn": rated, "max_users": 2}
+        for k, x in enumerate(xs)]
+    return anchors
+
+
+def twin_passable_payload():
+    """双腿分挂左右锚点的可通行基准（自动序列）。"""
+    return {
+        "route": {
+            "walk_polyline": [v(0, 0, 0), v(1, 0, 0)],
+            "drop_edges": [], "obstacles": [],
+            "anchors": twin_side_anchors(),
+            "supports": [], "spans": [], "shuttles": [],
+        },
+        "persons": [base_person(equipment_id="eqt")],
+        "equipment": [twin_equipment()],
+        "params": {"station_spacing_m": 0.5},
+    }
+
+
+def twin_angle_payload(max_angle=40.0):
+    """允许夹角收紧到 40°：实际夹角约 74°，夹角越限。"""
+    p = twin_passable_payload()
+    p["equipment"] = [twin_equipment()]
+    p["equipment"][0]["twin_leg"]["max_included_angle_deg"] = max_angle
+    return p
+
+
+def twin_energy_payload():
+    """缓冲曲线能量容量不足：重人 + 短行程低力曲线 + 低位锚点。"""
+    p = twin_passable_payload()
+    p["route"]["anchors"] = [
+        {"id": "A1", "position": v(0, 0, 0.4), "rated_load_kn": 12.0,
+         "max_users": 2},
+        {"id": "A2", "position": v(0.3, 0, 0.4), "rated_load_kn": 12.0,
+         "max_users": 2},
+    ]
+    p["persons"] = [base_person("p1", weight_kg=120.0, equipment_id="eqt")]
+    eq = twin_equipment()
+    eq["twin_leg"]["buffer_curve"] = [
+        {"travel_m": 0.0, "force_kn": 2.0},
+        {"travel_m": 0.2, "force_kn": 2.0}]
+    eq["twin_leg"]["max_travel_m"] = 0.2
+    eq["twin_leg"]["energy_capacity_j"] = 400.0
+    p["equipment"] = [eq]
+    return p
+
+
+def twin_side_load_payload(limit=0.1):
+    """连接器侧载限值收紧：分挂侧锚时水平分量超限。"""
+    p = twin_passable_payload()
+    eq = twin_equipment()
+    for leg in eq["twin_leg"]["legs"]:
+        leg["connector_side_load_limit_kn"] = limit
+    p["equipment"] = [eq]
+    return p
+
+
+def twin_unequal_legs_payload(la=2.5, lb=1.4):
+    """两腿不等长：短腿（B）够不到左右侧锚点 → 腿长不足。"""
+    p = twin_passable_payload()
+    eq = twin_equipment()
+    eq["twin_leg"]["legs"][0]["leg_length_m"] = la
+    eq["twin_leg"]["legs"][1]["leg_length_m"] = lb
+    p["equipment"] = [eq]
+    return p
+
+
+def twin_manual_payload():
+    """人工次序：A 钩（LA 腿）挂左列 a0，B 钩（LB 腿）挂右列 b0。"""
+    p = twin_passable_payload()
+    p["hook_order"] = [
+        {"person_id": "p1", "hook": "A", "action": "attach",
+         "anchor": "a0", "station_index": 0, "leg": "LA"},
+        {"person_id": "p1", "hook": "B", "action": "attach",
+         "anchor": "b0", "station_index": 0, "leg": "LB"},
+    ]
+    return p
+
+
+def twin_flex_payload():
+    """双腿各挂一条滑梭（同跨不同滑梭）的柔性跨段场景。"""
+    route = flex_span_route(
+        shuttles=[
+            {"id": "T1", "span_id": "H1", "connector_reach_m": 0.3,
+             "max_users": 1, "can_pass": True},
+            {"id": "T2", "span_id": "H1", "connector_reach_m": 0.3,
+             "max_users": 1, "can_pass": True},
+        ])
+    return {
+        "route": route,
+        "persons": [base_person(equipment_id="eqt", d_ring_height_m=1.4)],
+        "equipment": [{
+            "id": "eqt",
+            "lanyard_length_m": 1.6, "elongation_m": 0.2,
+            "buffer_travel_m": 1.0, "sharp_edge_rating": 1,
+            "connector_reach_m": 0.3, "max_arrest_force_kn": 6.0,
+            "twin_leg": {
+                "legs": [
+                    {"id": "LA", "hook": "A", "leg_length_m": 1.6,
+                     "axial_stiffness_kn": 2000.0,
+                     "connector_side_load_limit_kn": 16.0},
+                    {"id": "LB", "hook": "B", "leg_length_m": 1.6,
+                     "axial_stiffness_kn": 2000.0,
+                     "connector_side_load_limit_kn": 16.0},
+                ],
+                "buffer_curve": [
+                    {"travel_m": 0.0, "force_kn": 3.0},
+                    {"travel_m": 1.2, "force_kn": 3.0},
+                ],
+                "max_travel_m": 1.2, "energy_capacity_j": 5000.0,
+                "max_included_angle_deg": 120.0,
+            }}],
+        "params": {"station_spacing_m": 0.5},
+    }
+
+
 # ---------------------------------------------------------------- 救援推演
 
 def rescue_payload(*, entry=None, anchors=None, rope_main_len=60.0,

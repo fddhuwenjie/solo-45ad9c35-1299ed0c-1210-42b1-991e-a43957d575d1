@@ -47,6 +47,7 @@ class LegOutcome:
     target_kind: str
     target_id: str
     anchor: Vec
+    length: float
     taut: bool
     tension_kn: float
     extension_m: float
@@ -168,7 +169,8 @@ def _leg_outcome(leg: LegTarget, J: Vec, taut: bool) -> LegOutcome:
     # 连接器侧载约定：取绳腿张力的水平分量（横向加载），与侧载限值比较
     return LegOutcome(
         leg_id=leg.leg_id, hook=leg.hook, target_kind=leg.target_kind,
-        target_id=leg.target_id, anchor=leg.anchor, taut=taut,
+        target_id=leg.target_id, anchor=leg.anchor, length=leg.length,
+        taut=taut,
         tension_kn=T, extension_m=ext, vertical_component_kn=Tv,
         horizontal_component_kn=Th, side_load_kn=Th,
         side_limit_kn=leg.side_limit)
@@ -336,13 +338,28 @@ def solve_twin_legs(person_weight_kg: float, gravity: float,
                     return None
                 Jj, hh, _d = st
             else:
-                if warm is None:
-                    st0 = _single_leg_state(eff[0], d_ring, dz0, s, F)
-                    if st0 is None:
-                        return None
-                    J0, h0, _d0 = st0
-                    warm = (J0[0], J0[1], J0[2], h0)
-                sol = _solve4(s, F, d_ring, dz0, eff, warm)
+                sol = None
+                # 多初值：外部热启动 → 两锚中点附近 → 各单腿解析解 →
+                # 人体正下方，覆盖非对称几何下单腿猜测偏离真实解的情形
+                guesses: list[tuple] = []
+                if warm is not None:
+                    guesses.append(warm)
+                ax = sum(e.anchor[0] for e in eff) / len(eff)
+                ay = sum(e.anchor[1] for e in eff) / len(eff)
+                minlen = min(e.length for e in eff)
+                for zoff in (0.0, 0.02, 0.1, 0.3):
+                    guesses.append((ax, ay, dz0 - s - zoff,
+                                    max(0.0, zoff + s)))
+                for e in eff:
+                    ste = _single_leg_state(e, d_ring, dz0, s, F)
+                    if ste is not None:
+                        Je, he, _de = ste
+                        guesses.append((Je[0], Je[1], Je[2], he))
+                guesses.append((d_ring[0], d_ring[1], dz0 - s, s))
+                for g0 in guesses:
+                    sol = _solve4(s, F, d_ring, dz0, eff, g0)
+                    if sol is not None:
+                        break
                 if sol is None:
                     return None
                 Jj, hh = sol
@@ -406,7 +423,6 @@ def solve_twin_legs(person_weight_kg: float, gravity: float,
                             reason="equilibrium_solver_failed")
     seen_positive = r_prev > 1e-9
     root = None
-    static_hang = False
     for k in range(1, n_steps + 1):
         s = k * ds
         st = state_at(s, warm_prev, set(active_prev))
@@ -480,12 +496,6 @@ def solve_twin_legs(person_weight_kg: float, gravity: float,
                      active={x.leg_id for x in active})
 
 
-def first_anchor_J(first: LegTarget, d0: Vec, dz0: float) -> Vec:
-    H = _horizontal(first.anchor, d0)
-    g = math.sqrt(max(0.0, first.length ** 2 - H ** 2))
-    return (d0[0], d0[1], first.anchor[2] - g)
-
-
 def _assemble(legs, order, J, s, h, h1, F, demand, e_buf, e_el,
               tensions=None, active=None, drop_h=None) -> TwinSolution:
     outcomes = []
@@ -525,6 +535,8 @@ def build_leg_targets(eq, by_hook, person, station, i, anchors, shuttles,
     """由钩→(kind,id) 映射构造双腿求解输入（滑梭挂点可随下挠下移）。"""
     out = []
     for leg in eq.twin_leg.legs:
+        if leg.hook not in by_hook:
+            continue                       # 该钩当前无连接（如单钩起步）
         kind, tid = by_hook[leg.hook]
         if kind == "anchor":
             ap = anchors[tid].position.as_tuple()
@@ -538,14 +550,3 @@ def build_leg_targets(eq, by_hook, person, station, i, anchors, shuttles,
             stiffness=leg.axial_stiffness_kn,
             side_limit=leg.connector_side_load_limit_kn))
     return out
-
-
-def leg_length_ok(sol: TwinSolution) -> tuple[bool, str | None]:
-    """求解后检查：是否所有承拉腿都在几何允许内（无超程硬拉）。
-
-    单连接挂接可达由序列层用 L+触及余量判定；这里捕捉“挂上了但竖直
-    坠落路径上水平投影超过腿原长”的几何不可行（no_leg_engages）。
-    """
-    if sol.reason == "no_leg_engages":
-        return False, "no_leg_engages"
-    return True, None

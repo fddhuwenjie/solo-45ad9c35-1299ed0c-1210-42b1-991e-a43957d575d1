@@ -14,7 +14,7 @@ from .models import (AnalysisResult, ChangeRecord, PlanCreate, PlanOut,
                      RescueRevisionOut, RevisionCreate, RevisionMeta,
                      RevisionOut)
 
-app = FastAPI(title="生命线通行核算接口", version="1.2.0")
+app = FastAPI(title="生命线通行核算接口", version="1.3.0")
 
 _store: Store | None = None
 
@@ -52,8 +52,24 @@ def _revision_out(store: Store, plan_id: str, rev_no: int) -> RevisionOut:
         payload=payload, changes=_changes(row), analysis=analyze(payload))
 
 
+def _lanyard_signature(p: PlanPayload):
+    """Y 型双腿系绳的结构性参数：腿长、轴向刚度、侧载限值、钩腿绑定、
+    缓冲力—行程曲线、最大行程、能量容量、允许夹角。变化即重大修改。"""
+    def tw(e):
+        if e.twin_leg is None:
+            return None
+        t = e.twin_leg
+        return (
+            [(l.id, l.hook, l.leg_length_m, l.axial_stiffness_kn,
+              l.connector_side_load_limit_kn) for l in t.legs],
+            [(pt.travel_m, pt.force_kn) for pt in t.buffer_curve],
+            t.max_travel_m, t.energy_capacity_j, t.max_included_angle_deg,
+        )
+    return [(e.id, tw(e)) for e in p.equipment]
+
+
 def _structural_route_signature(p: PlanPayload):
-    """跨段 / 滑梭的结构性参数（不含说明性字段）；变化即重大修改。"""
+    """跨段 / 滑梭 / 双腿系绳的结构性参数（不含说明性字段）；变化即重大修改。"""
     return (
         [(s.id, s.supports, s.pretension_kn, s.line_density_kg_m,
           s.axial_stiffness_kn, s.cross_section_m2, s.elastic_modulus_kn_m2,
@@ -64,6 +80,7 @@ def _structural_route_signature(p: PlanPayload):
         [(s.id, s.position.model_dump(), s.rated_load_kn,
           s.allowed_axis.model_dump() if s.allowed_axis else None,
           s.allowed_half_angle_deg) for s in p.route.supports],
+        _lanyard_signature(p),
     )
 
 
@@ -83,6 +100,7 @@ def _require_change_reason(body: RevisionCreate | PlanCreate,
         if sig_prev != sig_new:
             span_changed = sig_prev[0] != sig_new[0] or sig_prev[2] != sig_new[2]
             shuttle_changed = sig_prev[1] != sig_new[1]
+            lanyard_changed = sig_prev[3] != sig_new[3]
             if span_changed and "span_change" not in kinds:
                 raise HTTPException(
                     422, "对柔性跨段/端座/中间支座的重大修改"
@@ -93,6 +111,12 @@ def _require_change_reason(body: RevisionCreate | PlanCreate,
                 raise HTTPException(
                     422, "更换/修改滑梭必须在 changes 中给出 "
                          "kind=shuttle_change 的理由")
+            if lanyard_changed and "lanyard_change" not in kinds:
+                raise HTTPException(
+                    422, "修改 Y 型双腿系绳（腿原长、轴向刚度、缓冲力—行程"
+                         "曲线、最大行程/能量容量、允许夹角、连接器侧载限值"
+                         "或钩腿绑定）必须在 changes 中给出 "
+                         "kind=lanyard_change 的理由")
 
 
 # ---------------------------------------------------------------- 方案
@@ -180,12 +204,16 @@ def update_revision(plan_id: str, rev_no: int, body: RevisionCreate,
     sig_prev = _structural_route_signature(prev_payload)
     sig_new = _structural_route_signature(body.payload)
     if sig_prev != sig_new:
-        what = "柔性跨段/端座/中间支座" if sig_prev[0] != sig_new[0] \
-            or sig_prev[2] != sig_new[2] else "滑梭"
+        if sig_prev[0] != sig_new[0] or sig_prev[2] != sig_new[2]:
+            what = "柔性跨段/端座/中间支座"
+        elif sig_prev[1] != sig_new[1]:
+            what = "滑梭"
+        else:
+            what = "Y 型双腿系绳（腿长/缓冲曲线/钩腿绑定）"
         raise HTTPException(
             409, f"{what}的重大修改必须另存修订（POST .../revisions）以保留"
                  f"旧版参数，不允许覆盖既有草稿；请在新修订 changes 中"
-                 f"附 span_change/shuttle_change 理由")
+                 f"附 span_change/shuttle_change/lanyard_change 理由")
     _require_change_reason(body, body.payload, prev_payload)
     ok = store.update_draft_payload(
         plan_id, rev_no, body.payload.model_dump_json(),
